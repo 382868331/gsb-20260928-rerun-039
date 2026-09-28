@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "molkit"
+version = "0.1.0"
+description = "分子结构读取、原子身份对应与刚体空间对齐工具包"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[tool.setuptools.packages.find]
+include = ["molkit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
