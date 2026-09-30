@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
@@ -79,12 +80,23 @@ def load_structure(path: str | Path) -> Structure:
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix == ".xyz":
-        return load_xyz(path)
-    if suffix == ".json":
-        return load_json(path)
-    if suffix in {".pdb", ".ent"}:
-        return load_pdb(path)
-    raise ValueError(f"Unsupported structure format: {suffix}")
+        structure = load_xyz(path)
+    elif suffix == ".json":
+        structure = load_json(path)
+    elif suffix in {".pdb", ".ent"}:
+        structure = load_pdb(path)
+    else:
+        raise ValueError(f"Unsupported structure format: {suffix}")
+    structure.metadata.setdefault("source_path", str(path))
+    return structure
+
+
+def structure_fingerprint(structure: Structure) -> str:
+    payload = "\n".join(
+        f"{atom.key}:{atom.element}:{atom.xyz[0]:.12g}:{atom.xyz[1]:.12g}:{atom.xyz[2]:.12g}"
+        for atom in structure.atoms
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def save_structure(structure: Structure, path: str | Path) -> None:
