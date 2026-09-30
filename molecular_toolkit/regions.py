@@ -20,6 +20,14 @@ class RegionDisplacements:
     mobile_keys: list[int]
     distances: list[float] = field(default_factory=list)
     vectors: list[list[float]] = field(default_factory=list)
+    local_translation: list[float] | None = None
+    local_rotation: list[list[float]] | None = None
+    local_rotation_angle: float | None = None
+    local_rotation_axis: list[float] | None = None
+    internal_distances: list[float] = field(default_factory=list)
+    internal_vectors: list[list[float]] = field(default_factory=list)
+    internal_rmsd_value: float | None = None
+    rigid_fit_status: str = "not_fitted"
 
     @property
     def rmsd(self) -> float:
@@ -39,6 +47,16 @@ class RegionDisplacements:
         if not self.distances:
             raise ValueError(f"Region {self.name!r} has no paired atoms")
         return float(np.percentile(self.distances, value))
+
+    @property
+    def translation_distance(self) -> float | None:
+        if self.local_translation is None:
+            return None
+        return float(np.linalg.norm(self.local_translation))
+
+    @property
+    def internal_rmsd(self) -> float | None:
+        return self.internal_rmsd_value
 
     def to_dict(self) -> dict:
         per_atom = [
@@ -60,6 +78,15 @@ class RegionDisplacements:
             "median_displacement": self.percentile(50) if self.distances else None,
             "max_displacement": self.max_displacement if self.distances else None,
             "p95_displacement": self.percentile(95) if self.distances else None,
+            "translation_vector": self.local_translation,
+            "translation_distance": self.translation_distance,
+            "rotation": self.local_rotation,
+            "rotation_angle_deg": self.local_rotation_angle,
+            "rotation_axis": self.local_rotation_axis,
+            "internal_rmsd": self.internal_rmsd_value,
+            "internal_distances": self.internal_distances,
+            "internal_vectors": self.internal_vectors,
+            "rigid_fit_status": self.rigid_fit_status,
             "per_atom": per_atom,
         }
 
@@ -74,6 +101,8 @@ class RegionAlignmentResult:
     stable_rmsd_reflected: float
     is_mirror_candidate: bool
     regions: dict[str, RegionDisplacements] = field(default_factory=dict)
+    stable_reference_keys: list[int] = field(default_factory=list)
+    region_definitions: dict[str, dict[str, list[int] | None]] = field(default_factory=dict)
 
     @property
     def stable_rmsd(self) -> float:
@@ -90,6 +119,8 @@ class RegionAlignmentResult:
                 {"reference_key": ref_key, "mobile_key": mobile_key}
                 for ref_key, mobile_key in self.stable_pairs
             ],
+            "stable_reference_keys": self.stable_reference_keys,
+            "region_definitions": self.region_definitions,
             "stable_rmsd": self.stable_rmsd_proper,
             "stable_rmsd_reflected": self.stable_rmsd_reflected,
             "is_mirror_candidate": self.is_mirror_candidate,
@@ -118,6 +149,7 @@ def align_on_stable_atoms(
     """
     stable_keys = _validate_keys(stable_reference_keys, reference, "stable reference")
     stable_set = set(stable_keys)
+    region_definitions: dict[str, dict[str, list[int] | None]] = {}
     pair_map = dict(pairs)
     reverse_map = {mobile_key: ref_key for ref_key, mobile_key in pairs}
     if len(reverse_map) != len(pairs):
@@ -148,12 +180,18 @@ def align_on_stable_atoms(
         stable_rmsd_proper=float(rmsd_proper),
         stable_rmsd_reflected=float(rmsd_reflected),
         is_mirror_candidate=bool(is_mirror),
+        stable_reference_keys=stable_keys,
+        region_definitions=region_definitions,
     )
 
     assigned_pairs: set[Pair] = set(stable_pairs)
     if regions:
         for name, value in regions.items():
             ref_keys, mobile_keys = _normalize_region(value)
+            region_definitions[name] = {
+                "reference_keys": ref_keys,
+                "mobile_keys": mobile_keys,
+            }
             region_pairs = _resolve_region_pairs(
                 name, ref_keys, mobile_keys, reference, mobile, pair_map
             )
@@ -246,10 +284,70 @@ def _measure_region(name, reference, aligned_mobile, pairs):
         vector = aligned_mobile.atom(mobile_key).xyz - reference.atom(ref_key).xyz
         vectors.append(vector.tolist())
         distances.append(float(np.linalg.norm(vector)))
-    return RegionDisplacements(
+    result = RegionDisplacements(
         name=name,
         reference_keys=[pair[0] for pair in pairs],
         mobile_keys=[pair[1] for pair in pairs],
         distances=distances,
         vectors=vectors,
     )
+    reference_points = np.vstack([reference.atom(key).xyz for key in result.reference_keys])
+    aligned_points = np.vstack([aligned_mobile.atom(key).xyz for key in result.mobile_keys])
+    _add_local_motion(result, reference_points, aligned_points)
+    return result
+
+
+def _add_local_motion(result, reference_points, aligned_points):
+    reference_center = reference_points.mean(axis=0)
+    aligned_center = aligned_points.mean(axis=0)
+    translation = reference_center - aligned_center
+    result.local_translation = translation.tolist()
+    if len(reference_points) < 3:
+        residual = (aligned_points + translation) - reference_points
+        result.internal_vectors = residual.tolist()
+        result.internal_distances = np.linalg.norm(residual, axis=1).tolist()
+        result.internal_rmsd_value = float(np.sqrt(np.mean(np.sum(residual**2, axis=1))))
+        result.rigid_fit_status = "underdetermined_rotation"
+        return
+
+    reference_centered = reference_points - reference_center
+    aligned_centered = aligned_points - aligned_center
+    rank = int(np.linalg.matrix_rank(np.vstack([reference_centered, aligned_centered]), tol=1e-8))
+    if rank < 2:
+        result.rigid_fit_status = "degenerate_geometry"
+        return
+
+    covariance = aligned_centered.T @ reference_centered
+    u, _, vt = np.linalg.svd(covariance)
+    rotation = vt.T @ u.T
+    if np.linalg.det(rotation) < 0:
+        u[:, -1] *= -1
+        rotation = vt.T @ u.T
+    translation = reference_center - rotation @ aligned_center
+    result.local_translation = translation.tolist()
+    fitted = (aligned_points - aligned_center) @ rotation.T + reference_center
+    residual = fitted - reference_points
+    angle_value, axis = _rotation_axis_angle(rotation)
+    result.local_rotation = rotation.tolist()
+    result.local_rotation_angle = angle_value
+    result.local_rotation_axis = axis if isinstance(axis, list) else axis.tolist()
+    result.internal_vectors = residual.tolist()
+    result.internal_distances = np.linalg.norm(residual, axis=1).tolist()
+    result.internal_rmsd_value = float(np.sqrt(np.mean(np.sum(residual**2, axis=1))))
+    result.rigid_fit_status = "fitted"
+
+
+def _rotation_axis_angle(rotation):
+    trace_value = min(3.0, max(-1.0, float(np.trace(rotation))))
+    cosine = min(1.0, max(-1.0, (trace_value - 1.0) / 2.0))
+    angle_value = float(np.degrees(np.arccos(cosine)))
+    if angle_value < 1e-10 or angle_value > 180.0 - 1e-10:
+        return angle_value, [0.0, 0.0, 1.0]
+    axis = np.array(
+        [
+            rotation[2, 1] - rotation[1, 2],
+            rotation[0, 2] - rotation[2, 0],
+            rotation[1, 0] - rotation[0, 1],
+        ]
+    )
+    return angle_value, (axis / np.linalg.norm(axis)).tolist()

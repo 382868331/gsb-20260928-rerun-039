@@ -59,9 +59,14 @@ result = align_on_stable_atoms(
     stable_reference_keys=[0, 1, 2, 3],
     regions={"loop": ([10, 11, 12], [10, 11, 12])},
 )
-result.region("loop").rmsd
+result.region("loop").rmsd  # 稳定参照对齐后的总位移 RMSD
+result.region("loop").translation_distance
+result.region("loop").local_rotation_angle
+result.region("loop").internal_rmsd  # 扣除该区域自身刚体平移/旋转后的内部形变
 result.region("unselected")  # 未归入稳定集合或命名区域的对应原子
 ```
+
+每个区域同时给出区域中心相对位移、局部刚体旋转矩阵、旋转角/旋转轴、逐原子内部残差向量和内部形变 RMSD。少于三个原子或几何退化时不会虚构唯一三维旋转，`rigid_fit_status` 会标记为 `underdetermined_rotation` 或 `degenerate_geometry`；已有总位移仍保留，避免把参照对齐吸收的整体运动误写成区域没有变化。
 
 结果同时返回 `stable_rmsd_proper`、`stable_rmsd_reflected` 和 `is_mirror_candidate`，用于提示镜像对应；`check_mirror` 可单独核对候选对应。除非显式 `allow_reflection=True`，镜像不会被静默接受。
 
@@ -105,3 +110,36 @@ save_comparison_report(
 ```
 
 报告记录每个构象的来源、候选 ID、完整原子对、未匹配/歧义原子、稳定原子拟合和各区域位移。对齐只生成新坐标，原始结构对象和源文件保持不变。
+
+## 项目保存、重开与多参照区域
+
+需要跨会话复现实验时，使用 `ComparisonProject` 保存源结构路径、构象顺序、人工确认的原子对或候选、所有可选解释、参照区域和局部区域定义：
+
+```python
+from molecular_toolkit import (
+    ComparisonProject,
+    ConformerCorrespondenceSpec,
+    load_comparison_project,
+    run_comparison_project,
+    save_comparison_project,
+)
+
+project = ComparisonProject(
+    reference_path="reference.xyz",
+    conformers=[
+        ConformerCorrespondenceSpec.from_correspondence(path, correspondence)
+        for path, correspondence in zip(paths, correspondences)
+    ],
+    reference_regions={
+        "core": [0, 1, 2, 3],
+        "domain_b": [8, 9, 10, 11],
+    },
+    regions={"loop": ([20, 21, 22], None)},
+)
+save_comparison_project(project, "comparison_project.json")
+
+reopened = load_comparison_project("comparison_project.json")
+runs = run_comparison_project(reopened, report_directory="reports")
+```
+
+`run_comparison_project` 会按保存的构象顺序分别为每个参照区域重算一份报告；`reports/reference_region_summary.json` 对相同局部区域在不同参照下的总 RMSD、平移、旋转和内部形变差值进行汇总。缺失原子继续保留为未匹配；等价原子交换的所有候选及人工锁定/确认状态随项目保存，重新打开后不需要重新猜测。

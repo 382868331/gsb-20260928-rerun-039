@@ -20,6 +20,8 @@ class AtomCorrespondence:
     unmatched_mobile: list[AtomKey] = field(default_factory=list)
     ambiguous_identities: dict[str, dict[str, list[AtomKey]]] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    confirmed: bool = False
+    confirmation_note: str | None = None
 
     @property
     def is_complete(self) -> bool:
@@ -48,6 +50,18 @@ def match_atoms(
     return match_by_identity(reference, mobile, identity, require_same_element)
 
 
+def confirm_correspondence(
+    correspondence: AtomCorrespondence,
+    note: str = "Human review confirmed this atom correspondence.",
+) -> AtomCorrespondence:
+    """Record a human decision while retaining unmatched and ambiguous atoms."""
+    correspondence.confirmed = True
+    correspondence.confirmation_note = note
+    if "human_confirmed" not in correspondence.notes:
+        correspondence.notes.append("human_confirmed")
+    return correspondence
+
+
 def match_explicit(
     reference: Structure,
     mobile: Structure,
@@ -61,7 +75,7 @@ def match_explicit(
     pairs: list[Pair] = []
     used_reference: set[AtomKey] = set()
     used_mobile: set[AtomKey] = set()
-    notes: list[str] = []
+    notes: list[str] = ["manual_correspondence"]
     for ref_selector, mobile_selector in raw_pairs:
         ref_key = resolve_atom_key(reference, ref_selector, "reference")
         mobile_key = resolve_atom_key(mobile, mobile_selector, "mobile")
@@ -84,6 +98,8 @@ def match_explicit(
         unmatched_reference=[key for key in range(len(reference)) if key not in used_reference],
         unmatched_mobile=[key for key in range(len(mobile)) if key not in used_mobile],
         notes=notes,
+        confirmed=True,
+        confirmation_note="All supplied atom pairs were explicitly selected.",
     )
 
 

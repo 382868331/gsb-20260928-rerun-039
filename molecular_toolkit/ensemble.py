@@ -48,12 +48,16 @@ class ConformerComparison:
     correspondence: AtomCorrespondence
     alignment: RegionAlignmentResult
     candidate_id: str | None = None
+    alternative_candidates: Sequence[CorrespondenceCandidate] | None = None
+    correspondence_status: str = "auto"
 
     def to_dict(self) -> dict:
         return {
             "conformer": self.conformer.provenance(),
             "candidate_id": self.candidate_id,
+            "correspondence_status": self.correspondence_status,
             "correspondence": correspondence_to_dict(self.correspondence),
+            "alternative_candidates": [candidate.to_dict() for candidate in self.alternative_candidates or []],
             "alignment": self.alignment.to_dict(),
         }
 
@@ -64,13 +68,16 @@ def compare_conformer(
     correspondence: AtomCorrespondence | CorrespondenceCandidate,
     stable_reference_keys: Iterable[int],
     regions: dict[str, tuple[Iterable[int], Iterable[int] | None]] | None = None,
+    alternative_candidates: Sequence[CorrespondenceCandidate] | None = None,
 ) -> ConformerComparison:
     if isinstance(correspondence, CorrespondenceCandidate):
         candidate_id = correspondence.candidate_id
         atom_correspondence = correspondence.to_correspondence()
+        status = "confirmed" if correspondence.confirmed or correspondence.locked_pairs else "alternative"
     else:
         candidate_id = None
         atom_correspondence = correspondence
+        status = "confirmed" if atom_correspondence.confirmed else "auto"
     alignment = align_on_stable_atoms(
         reference,
         conformer.structure,
@@ -83,6 +90,8 @@ def compare_conformer(
         correspondence=atom_correspondence,
         alignment=alignment,
         candidate_id=candidate_id,
+        alternative_candidates=alternative_candidates,
+        correspondence_status=status,
     )
 
 
@@ -91,12 +100,23 @@ def compare_ensemble(
     conformers: Sequence[tuple[Conformer, AtomCorrespondence | CorrespondenceCandidate]],
     stable_reference_keys: Iterable[int],
     regions: dict[str, tuple[Iterable[int], Iterable[int] | None]] | None = None,
+    alternative_candidates_by_conformer: Sequence[Sequence[CorrespondenceCandidate] | None] | None = None,
 ) -> list[ConformerComparison]:
     if isinstance(reference, Conformer):
         reference = reference.structure
+    alternatives_by_index = alternative_candidates_by_conformer or []
     return [
-        compare_conformer(reference, conformer, correspondence, stable_reference_keys, regions)
-        for conformer, correspondence in conformers
+        compare_conformer(
+            reference,
+            conformer,
+            correspondence,
+            stable_reference_keys,
+            regions,
+            alternative_candidates=alternatives_by_index[index]
+            if index < len(alternatives_by_index)
+            else None,
+        )
+        for index, (conformer, correspondence) in enumerate(conformers)
     ]
 
 
@@ -158,4 +178,6 @@ def correspondence_to_dict(correspondence: AtomCorrespondence) -> dict:
         "unmatched_mobile": correspondence.unmatched_mobile,
         "ambiguous_identities": correspondence.ambiguous_identities,
         "notes": correspondence.notes,
+        "confirmed": correspondence.confirmed,
+        "confirmation_note": correspondence.confirmation_note,
     }

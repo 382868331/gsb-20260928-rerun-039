@@ -7,18 +7,25 @@ import numpy as np
 
 from molecular_toolkit import (
     Atom,
+    ComparisonProject,
+    ConformerCorrespondenceSpec,
     ReflectionAlignmentError,
     Structure,
     align_on_stable_atoms,
     candidates_from_identity,
     check_mirror,
     compare_ensemble,
+    compare_conformer,
     Conformer,
+    confirm_candidate,
     enumerate_candidates,
     load_structure,
+    load_comparison_project,
     lock_candidate_pairs,
     match_atoms,
+    run_comparison_project,
     save_comparison_report,
+    save_comparison_project,
 )
 
 
@@ -187,6 +194,108 @@ class EnsembleTests(unittest.TestCase):
         )
         np.testing.assert_allclose(conformer_b.coordinates, originals[0])
         np.testing.assert_allclose(conformer_c.coordinates, originals[1])
+
+    def test_region_motion_is_split_from_internal_deformation(self):
+        coordinates = np.vstack(
+            [
+                tetra_frame().coordinates[:4],
+                np.array([[2.0, 0.0, 0.0], [2.0, 1.0, 0.0], [2.0, 0.0, 1.0]]),
+            ]
+        )
+        reference = Structure([Atom(i, "C", coordinates[i], serial=i + 1) for i in range(7)])
+        local_rotation = np.array(
+            [
+                [np.cos(0.25), -np.sin(0.25), 0.0],
+                [np.sin(0.25), np.cos(0.25), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        mobile_coords = reference.coordinates.copy()
+        local_indices = np.array([4, 5, 6])
+        local_ref = mobile_coords[local_indices]
+        local_center = local_ref.mean(axis=0)
+        mobile_coords[local_indices] = 1.1 * ((local_ref - local_center) @ local_rotation.T) + local_center
+        mobile = Structure([Atom(i, "C", mobile_coords[i], serial=i + 1) for i in range(7)])
+        pairs = match_atoms(reference, mobile, explicit_pairs=[(i, i) for i in range(7)]).pairs
+
+        result = align_on_stable_atoms(
+            reference,
+            mobile,
+            pairs,
+            stable_reference_keys=[0, 1, 2, 3],
+            regions={"hinge": ([4, 5, 6], [4, 5, 6])},
+        )
+        hinge = result.region("hinge")
+
+        self.assertEqual(hinge.rigid_fit_status, "fitted")
+        self.assertAlmostEqual(hinge.local_rotation_angle, 14.3239448782706, places=6)
+        radius_rmsd = np.sqrt(np.mean(np.sum((local_ref - local_center) ** 2, axis=1)))
+        self.assertGreater(hinge.rmsd, hinge.internal_rmsd)
+        self.assertAlmostEqual(hinge.internal_rmsd, 0.1 * radius_rmsd, places=8)
+
+    def test_project_preserves_manual_choices_reference_regions_and_order(self):
+        reference = tetra_frame()
+        mobile_coords = reference.coordinates + [0.0, 0.0, 2.0]
+        mobile_coords[4] += [0.0, 0.5, 0.0]
+        mobile = Structure([Atom(i, "C", mobile_coords[i], serial=i + 1) for i in range(6)])
+        original = mobile.coordinates.copy()
+        correspondence = match_atoms(reference, mobile, explicit_pairs=[(i, i) for i in range(6)])
+
+        with tempfile.TemporaryDirectory() as directory:
+            ref_path = Path(directory) / "reference.xyz"
+            mobile_path = Path(directory) / "conformer.xyz"
+            project_path = Path(directory) / "project.json"
+            from molecular_toolkit import save_structure
+
+            save_structure(reference, ref_path)
+            save_structure(mobile, mobile_path)
+            project = ComparisonProject(
+                reference_path=str(ref_path),
+                conformers=[
+                    ConformerCorrespondenceSpec.from_correspondence(
+                        mobile_path, correspondence, name="conformer"
+                    )
+                ],
+                reference_regions={"core": [0, 1, 2, 3], "tail_anchor": [0, 1, 4, 5]},
+                regions={"moving": ([4, 5], [4, 5])},
+            )
+            save_comparison_project(project, project_path)
+            reopened = load_comparison_project(project_path)
+            runs = run_comparison_project(reopened, report_directory=Path(directory) / "reports")
+            report = json.loads(
+                (Path(directory) / "reports" / "reference_region_summary.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(report["conformer_order"], [str(mobile_path)])
+        self.assertTrue(reopened.conformers[0].confirmed)
+        self.assertEqual(set(runs), {"core", "tail_anchor"})
+        self.assertIn("moving", report["effects"][str(mobile_path)])
+        np.testing.assert_allclose(mobile.coordinates, original)
+
+    def test_alternative_candidate_confirmation_is_saved_in_ensemble_report(self):
+        reference = tetra_frame(serials=(1, 2, 3, 4, 9, 9))
+        swapped = reference.coordinates.copy()
+        swapped[[4, 5]] = swapped[[5, 4]]
+        mobile = Structure(
+            [Atom(i, "C", swapped[i], serial=(1, 2, 3, 4, 9, 9)[i]) for i in range(6)]
+        )
+        candidates = candidates_from_identity(reference, mobile)
+        selected = confirm_candidate(candidates[1], "Tail orientation manually accepted.")
+        conformer = Conformer("sym", mobile)
+
+        comparison = compare_conformer(
+            reference,
+            conformer,
+            selected,
+            stable_reference_keys=[0, 1, 2, 3],
+            regions={"tail": ([4, 5], [4, 5])},
+            alternative_candidates=candidates,
+        )
+
+        record = comparison.to_dict()
+        self.assertEqual(record["correspondence_status"], "confirmed")
+        self.assertEqual(len(record["alternative_candidates"]), 2)
+        self.assertTrue(record["correspondence"]["confirmed"])
 
 
 if __name__ == "__main__":

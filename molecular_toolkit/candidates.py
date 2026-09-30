@@ -16,10 +16,15 @@ class CorrespondenceCandidate:
     candidate_id: str
     pairs: list[Pair]
     locked_pairs: list[Pair] = field(default_factory=list)
+    unmatched_reference: list[int] = field(default_factory=list)
+    unmatched_mobile: list[int] = field(default_factory=list)
+    ambiguous_identities: dict = field(default_factory=dict)
     rmsd_proper: float | None = None
     rmsd_reflected: float | None = None
     is_mirror_candidate: bool = False
     fit_error: str | None = None
+    confirmed: bool = False
+    confirmation_note: str | None = None
 
     @property
     def rmsd(self) -> float | None:
@@ -27,12 +32,22 @@ class CorrespondenceCandidate:
 
     def to_correspondence(self) -> AtomCorrespondence:
         locked = set(self.locked_pairs)
+        notes = [
+            f"candidate={self.candidate_id}",
+            f"locked_pairs={len(locked)}",
+        ]
+        confirmed = self.confirmed or bool(locked)
+        if confirmed:
+            notes.append("human_confirmed")
         return AtomCorrespondence(
             pairs=list(self.pairs),
-            notes=[
-                f"candidate={self.candidate_id}",
-                f"locked_pairs={len(locked)}",
-            ],
+            unmatched_reference=list(self.unmatched_reference),
+            unmatched_mobile=list(self.unmatched_mobile),
+            ambiguous_identities=dict(self.ambiguous_identities),
+            notes=notes,
+            confirmed=confirmed,
+            confirmation_note=self.confirmation_note
+            or ("At least one equivalent-atom relation was manually locked." if locked else None),
         )
 
     def to_dict(self) -> dict:
@@ -42,6 +57,9 @@ class CorrespondenceCandidate:
                 {"reference_key": ref_key, "mobile_key": mobile_key}
                 for ref_key, mobile_key in self.pairs
             ],
+            "unmatched_reference": self.unmatched_reference,
+            "unmatched_mobile": self.unmatched_mobile,
+            "ambiguous_identities": self.ambiguous_identities,
             "locked_pairs": [
                 {"reference_key": ref_key, "mobile_key": mobile_key}
                 for ref_key, mobile_key in self.locked_pairs
@@ -50,7 +68,19 @@ class CorrespondenceCandidate:
             "rmsd_reflected": self.rmsd_reflected,
             "is_mirror_candidate": self.is_mirror_candidate,
             "fit_error": self.fit_error,
+            "confirmed": self.confirmed or bool(self.locked_pairs),
+            "confirmation_note": self.confirmation_note
+            or ("At least one equivalent-atom relation was manually locked." if self.locked_pairs else None),
         }
+
+
+def confirm_candidate(
+    candidate: CorrespondenceCandidate,
+    note: str = "Human review selected this correspondence candidate.",
+) -> CorrespondenceCandidate:
+    candidate.confirmed = True
+    candidate.confirmation_note = note
+    return candidate
 
 
 def enumerate_candidates(
@@ -87,6 +117,10 @@ def enumerate_candidates(
     base = [(ref, mob) for ref, mob in base if ref not in locked_ref and mob not in locked_mob]
 
     groups = _normalize_groups(ambiguous_groups)
+    group_ambiguity = {
+        f"group-{index}": {"reference": list(ref_keys), "mobile": list(mob_keys)}
+        for index, (ref_keys, mob_keys) in enumerate(groups)
+    }
     option_lists: list[list[list[Pair]]] = []
     for index, (ref_keys, mob_keys) in enumerate(groups):
         ref_keys, mob_keys = _filter_group(ref_keys, mob_keys, locked_ref, locked_mob, index)
@@ -116,6 +150,9 @@ def enumerate_candidates(
             candidate_id=f"cand-{index:03d}",
             pairs=pairs,
             locked_pairs=list(locked),
+            ambiguous_identities=dict(group_ambiguity),
+            unmatched_reference=[key for key in range(len(reference)) if key not in {ref for ref, _ in pairs}],
+            unmatched_mobile=[key for key in range(len(mobile)) if key not in {mob for _, mob in pairs}],
         )
         if fit:
             _score_candidate(reference, mobile, candidate)

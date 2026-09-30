@@ -2,10 +2,11 @@ from .alignment import AlignmentResult, align_structures, save_alignment
 from .candidates import (
     CorrespondenceCandidate,
     candidates_from_identity,
+    confirm_candidate,
     enumerate_candidates,
     lock_candidate_pairs,
 )
-from .correspondence import AtomCorrespondence, match_atoms
+from .correspondence import AtomCorrespondence, confirm_correspondence, match_atoms
 from .ensemble import (
     Conformer,
     ConformerComparison,
@@ -14,6 +15,15 @@ from .ensemble import (
     save_comparison_report,
 )
 from .geometry import GeometryError, ReflectionAlignmentError, angle, dihedral, distance, kabsch, rmsd
+from .project import (
+    ComparisonProject,
+    ConformerCorrespondenceSpec,
+    load_comparison_project,
+    reference_region_differences,
+    run_comparison_project,
+    save_comparison_project,
+    save_reference_region_summary,
+)
 from .regions import (
     RegionAlignmentResult,
     RegionDisplacements,
@@ -34,6 +44,8 @@ __all__ = [
     "enumerate_candidates",
     "candidates_from_identity",
     "lock_candidate_pairs",
+    "confirm_candidate",
+    "confirm_correspondence",
     "RegionDisplacements",
     "RegionAlignmentResult",
     "align_on_stable_atoms",
@@ -43,6 +55,13 @@ __all__ = [
     "compare_conformer",
     "compare_ensemble",
     "save_comparison_report",
+    "ComparisonProject",
+    "ConformerCorrespondenceSpec",
+    "load_comparison_project",
+    "run_comparison_project",
+    "save_comparison_project",
+    "save_reference_region_summary",
+    "reference_region_differences",
     "AlignmentResult",
     "align_structures",
     "save_alignment",
