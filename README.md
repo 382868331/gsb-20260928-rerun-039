@@ -44,3 +44,64 @@ save_alignment(result, "alignment_report.json", "aligned_mobile.xyz")
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## 多构象与局部柔性区域
+
+`align_on_stable_atoms` 只使用调用者指定的稳定原子拟合刚体变换，再分别计算命名区域和未选中原子的位移分布（逐原子、RMSD、均值、中位数、95 分位、最大值），避免用整体 RMSD 掩盖局部位移：
+
+```python
+from molecular_toolkit import align_on_stable_atoms
+
+result = align_on_stable_atoms(
+    reference,
+    mobile,
+    correspondence.pairs,
+    stable_reference_keys=[0, 1, 2, 3],
+    regions={"loop": ([10, 11, 12], [10, 11, 12])},
+)
+result.region("loop").rmsd
+result.region("unselected")  # 未归入稳定集合或命名区域的对应原子
+```
+
+结果同时返回 `stable_rmsd_proper`、`stable_rmsd_reflected` 和 `is_mirror_candidate`，用于提示镜像对应；`check_mirror` 可单独核对候选对应。除非显式 `allow_reflection=True`，镜像不会被静默接受。
+
+## 歧义候选与人工锁定
+
+重复 serial、对称重复结构等情况可枚举所有双射候选。缺失原子不会被补造；每个候选保留完整原子对、锁定关系、正当/镜像 RMSD：
+
+```python
+from molecular_toolkit import candidates_from_identity, lock_candidate_pairs
+
+candidates = candidates_from_identity(reference, mobile)
+best = candidates[0]
+candidates = lock_candidate_pairs(candidates, [(4, 5)])  # 人工确认一对对称原子
+comparison = align_on_stable_atoms(
+    reference, mobile, best.pairs, stable_reference_keys=[0, 1, 2, 3]
+)
+```
+
+候选数量受 `max_candidates` 限制（默认 256），歧义过大时应先锁定更多关系。
+
+## 构象报告溯源
+
+`Conformer.from_file` 会记录源文件路径、格式和名称。`compare_ensemble` 逐构象应用各自的对应关系，`save_comparison_report` 保存 JSON 报告，并可导出对齐后的新结构：
+
+```python
+from molecular_toolkit import Conformer, compare_ensemble, save_comparison_report
+
+conformers = [Conformer.from_file(path) for path in paths]
+comparisons = compare_ensemble(
+    reference,
+    list(zip(conformers, correspondences)),
+    stable_reference_keys=[0, 1, 2, 3],
+    regions={"loop": ([10, 11, 12], None)},
+)
+save_comparison_report(
+    comparisons,
+    "comparison_report.json",
+    reference=reference,
+    aligned_directory="aligned",
+)
+```
+
+报告记录每个构象的来源、候选 ID、完整原子对、未匹配/歧义原子、稳定原子拟合和各区域位移。对齐只生成新坐标，原始结构对象和源文件保持不变。

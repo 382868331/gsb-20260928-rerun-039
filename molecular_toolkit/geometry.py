@@ -51,6 +51,35 @@ def kabsch(
     mobile: np.ndarray,
     allow_reflection: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float, bool]:
+    rotation, translation, _, rmsd_proper, rmsd_reflected = kabsch_transforms(
+        reference, mobile
+    )
+    is_reflection = False
+    if rmsd_reflected + 1e-10 < rmsd_proper:
+        is_reflection = True
+        if not allow_reflection:
+            raise ReflectionAlignmentError(
+                "Best orthogonal alignment is a reflection; atom ordering or enantiomer mapping may be wrong. "
+                "Pass allow_reflection=True only when an improper transformation is intended."
+            )
+        reflected_rotation, reflected_translation, _, _, _ = kabsch_transforms(
+            reference, mobile, force_reflection=True
+        )
+        return reflected_rotation, reflected_translation, rmsd_reflected, True
+    return rotation, translation, rmsd_proper, is_reflection
+
+
+def kabsch_transforms(
+    reference: np.ndarray,
+    mobile: np.ndarray,
+    force_reflection: bool = False,
+) -> tuple[np.ndarray, np.ndarray, bool, float, float]:
+    """Return rotation/translation for the requested branch plus both RMSDs.
+
+    ``force_reflection=False`` yields the best proper rotation; ``True`` yields
+    the best improper (det = -1) transformation.  The two RMSDs allow callers
+    to flag mirror mappings without silently accepting them.
+    """
     reference = np.asarray(reference, dtype=float)
     mobile = np.asarray(mobile, dtype=float)
     if reference.shape != mobile.shape or reference.ndim != 2 or reference.shape[1] != 3:
@@ -70,25 +99,25 @@ def kabsch(
     if singular_values[1] < 1e-10:
         raise GeometryError("Matched atoms are collinear or nearly collinear")
 
-    reflected_rotation = vt.T @ u.T
-    is_reflection = float(np.linalg.det(reflected_rotation)) < 0
-    if is_reflection and not allow_reflection:
-        raise ReflectionAlignmentError(
-            "Best orthogonal alignment is a reflection; atom ordering or enantiomer mapping may be wrong. "
-            "Pass allow_reflection=True only when an improper transformation is intended."
-        )
-    rotation = reflected_rotation
-    if is_reflection:
-        correction = np.diag([1.0, 1.0, -1.0])
-        rotation = vt.T @ correction @ u.T
-    translation = reference_center - rotation @ mobile_center
-    aligned = mobile @ rotation.T + translation
-    matched_rmsd = rmsd(reference, aligned)
-    if allow_reflection and is_reflection:
-        improper_translation = reference_center - reflected_rotation @ mobile_center
-        improper_aligned = mobile @ reflected_rotation.T + improper_translation
-        return reflected_rotation, improper_translation, rmsd(reference, improper_aligned), True
-    return rotation, translation, matched_rmsd, is_reflection
+    raw_rotation = vt.T @ u.T
+    raw_is_reflection = float(np.linalg.det(raw_rotation)) < 0
+    if raw_is_reflection:
+        improper_rotation = raw_rotation
+        proper_rotation = vt.T @ np.diag([1.0, 1.0, -1.0]) @ u.T
+    else:
+        proper_rotation = raw_rotation
+        improper_rotation = vt.T @ np.diag([1.0, 1.0, -1.0]) @ u.T
+
+    def aligned_rmsd(rotation_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+        shift = reference_center - rotation_matrix @ mobile_center
+        aligned = mobile @ rotation_matrix.T + shift
+        return rotation_matrix, shift, rmsd(reference, aligned)
+
+    proper_rotation, proper_translation, rmsd_proper = aligned_rmsd(proper_rotation)
+    improper_rotation, improper_translation, rmsd_improper = aligned_rmsd(improper_rotation)
+    if force_reflection:
+        return improper_rotation, improper_translation, True, rmsd_proper, rmsd_improper
+    return proper_rotation, proper_translation, False, rmsd_proper, rmsd_improper
 
 
 def _normalize(vector: np.ndarray) -> np.ndarray:

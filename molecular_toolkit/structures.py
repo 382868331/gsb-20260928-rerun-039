@@ -79,12 +79,21 @@ def load_structure(path: str | Path) -> Structure:
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix == ".xyz":
-        return load_xyz(path)
+        structure = load_xyz(path)
     if suffix == ".json":
-        return load_json(path)
+        structure = load_json(path)
     if suffix in {".pdb", ".ent"}:
-        return load_pdb(path)
-    raise ValueError(f"Unsupported structure format: {suffix}")
+        structure = load_pdb(path)
+    if suffix not in {".xyz", ".json", ".pdb", ".ent"}:
+        raise ValueError(f"Unsupported structure format: {suffix}")
+    provenance = {
+        "source_path": str(path),
+        "source_format": suffix.lstrip("."),
+        "structure_name": path.stem,
+    }
+    existing = structure.metadata.get("provenance")
+    structure.metadata["provenance"] = {**provenance, **(existing if isinstance(existing, dict) else {})}
+    return structure
 
 
 def save_structure(structure: Structure, path: str | Path) -> None:
