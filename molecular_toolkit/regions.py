@@ -7,6 +7,7 @@ import numpy as np
 
 from .correspondence import Pair
 from .geometry import ReflectionAlignmentError, kabsch_transforms
+from .motion import LocalMotion, decompose_local_motion
 from .structures import Structure, transform_structure
 
 
@@ -20,6 +21,7 @@ class RegionDisplacements:
     mobile_keys: list[int]
     distances: list[float] = field(default_factory=list)
     vectors: list[list[float]] = field(default_factory=list)
+    motion: LocalMotion | None = None
 
     @property
     def rmsd(self) -> float:
@@ -60,6 +62,7 @@ class RegionDisplacements:
             "median_displacement": self.percentile(50) if self.distances else None,
             "max_displacement": self.max_displacement if self.distances else None,
             "p95_displacement": self.percentile(95) if self.distances else None,
+            "motion": self.motion.to_dict() if self.motion is not None else None,
             "per_atom": per_atom,
         }
 
@@ -246,10 +249,14 @@ def _measure_region(name, reference, aligned_mobile, pairs):
         vector = aligned_mobile.atom(mobile_key).xyz - reference.atom(ref_key).xyz
         vectors.append(vector.tolist())
         distances.append(float(np.linalg.norm(vector)))
-    return RegionDisplacements(
+    measured = RegionDisplacements(
         name=name,
         reference_keys=[pair[0] for pair in pairs],
         mobile_keys=[pair[1] for pair in pairs],
         distances=distances,
         vectors=vectors,
     )
+    reference_points = np.vstack([reference.atom(pair[0]).xyz for pair in pairs])
+    aligned_points = np.vstack([aligned_mobile.atom(pair[1]).xyz for pair in pairs])
+    measured.motion = decompose_local_motion(reference_points, aligned_points)
+    return measured

@@ -7,6 +7,7 @@ from .candidates import (
 )
 from .correspondence import AtomCorrespondence, match_atoms
 from .ensemble import (
+    ComparisonSequence,
     Conformer,
     ConformerComparison,
     compare_conformer,
@@ -14,6 +15,15 @@ from .ensemble import (
     save_comparison_report,
 )
 from .geometry import GeometryError, ReflectionAlignmentError, angle, dihedral, distance, kabsch, rmsd
+from .motion import LocalMotion, decompose_local_motion
+from .project import Project, RegionDefinition
+from .reference_frames import (
+    FrameStudy,
+    ReferenceFrame,
+    compare_reference_frames,
+    explain_frame_difference,
+    frame_summary,
+)
 from .regions import (
     RegionAlignmentResult,
     RegionDisplacements,
@@ -38,6 +48,16 @@ __all__ = [
     "RegionAlignmentResult",
     "align_on_stable_atoms",
     "check_mirror",
+    "LocalMotion",
+    "decompose_local_motion",
+    "ReferenceFrame",
+    "FrameStudy",
+    "compare_reference_frames",
+    "explain_frame_difference",
+    "frame_summary",
+    "Project",
+    "RegionDefinition",
+    "ComparisonSequence",
     "Conformer",
     "ConformerComparison",
     "compare_conformer",

@@ -159,3 +159,63 @@ def correspondence_to_dict(correspondence: AtomCorrespondence) -> dict:
         "ambiguous_identities": correspondence.ambiguous_identities,
         "notes": correspondence.notes,
     }
+
+
+class ComparisonSequence:
+    """Ordered, conformer-order view over ensemble comparisons.
+
+    Comparisons are kept in construction order (the conformer order) rather
+    than sorted by RMSD or candidate score, so results can be stepped through
+    in trajectory order. Indexing and ``step`` accept negative indices.
+    """
+
+    def __init__(self, comparisons: Sequence[ConformerComparison]):
+        self._comparisons = list(comparisons)
+
+    def __len__(self) -> int:
+        return len(self._comparisons)
+
+    def __iter__(self):
+        return iter(self._comparisons)
+
+    def __getitem__(self, index: int | slice) -> ConformerComparison | list[ConformerComparison]:
+        return self._comparisons[index]
+
+    @property
+    def names(self) -> list[str]:
+        return [comparison.conformer.name for comparison in self._comparisons]
+
+    def get(self, index: int) -> ConformerComparison:
+        return self._comparisons[index]
+
+    def step(self, index: int, delta: int = 1) -> ConformerComparison:
+        if not self._comparisons:
+            raise IndexError("Empty comparison sequence")
+        return self._comparisons[(index + delta) % len(self._comparisons)]
+
+    def transitions(self) -> list[dict]:
+        """Region metric changes between successive conformers in order."""
+        changes = []
+        for current, following in zip(self._comparisons, self._comparisons[1:]):
+            region_names = set(current.alignment.regions) | set(following.alignment.regions)
+            region_change = {}
+            for name in sorted(region_names):
+                before = current.alignment.regions.get(name)
+                after = following.alignment.regions.get(name)
+                region_change[name] = {
+                    "rmsd_before": None if before is None else before.rmsd,
+                    "rmsd_after": None if after is None else after.rmsd,
+                    "rmsd_delta": (
+                        None
+                        if before is None or after is None
+                        else after.rmsd - before.rmsd
+                    ),
+                }
+            changes.append(
+                {
+                    "from": current.conformer.name,
+                    "to": following.conformer.name,
+                    "regions": region_change,
+                }
+            )
+        return changes
