@@ -143,3 +143,47 @@ runs = run_comparison_project(reopened, report_directory="reports")
 ```
 
 `run_comparison_project` 会按保存的构象顺序分别为每个参照区域重算一份报告；`reports/reference_region_summary.json` 对相同局部区域在不同参照下的总 RMSD、平移、旋转和内部形变差值进行汇总。缺失原子继续保留为未匹配；等价原子交换的所有候选及人工锁定/确认状态随项目保存，重新打开后不需要重新猜测。
+
+## 柔性区域的相对运动序列
+
+两个柔性区域可沿构象顺序分析相对运动。所有相对测量都先在用户选择的稳定参照原子上完成刚体对齐，再计算区域中心距离、区域轴夹角以及相对上一构象的 `approaching`、`receding` 或 `stationary` 状态；各区域自身的局部平移、旋转和内部 RMSD 同时保留，因此更换参照造成的整体变化不会被解释成区域内部变形。
+
+```python
+from molecular_toolkit import run_relative_motion_project
+
+payload = run_relative_motion_project(
+    project,
+    analysis_name='hinge_opening',
+    region_a='domain_a',
+    region_b='domain_b',
+    reference_region='stable_core',
+)
+
+payload['points'][0]['distance']
+payload['distance_intervals'][0]  # 所有对应解释的距离区间，None 表示该点无法确定
+payload['angle_intervals'][0]     # 无法确定角度时为 null，不会填 0
+```
+
+某些构象缺少区域原子时，只使用该构象中可用的对应原子，并记录 `missing_reference_keys`、`missing_conformer_keys` 和可用状态。存在多套原子对应时，当前人工选择作为 `selected` 值，其余候选共同给出距离和角度的结果区间；只有一个原子、轴退化或区域不可用时角度保持 `null`。
+
+一段构象序列可统一确认对应关系，并查看该决定直接影响的测量点以及下一构象的相对变化：
+
+```python
+from molecular_toolkit import (
+    confirm_sequence_correspondence,
+    decision_affected_measurements,
+    withdraw_correspondence_decision,
+)
+
+decision = confirm_sequence_correspondence(
+    project,
+    start_index=3,
+    end_index=8,
+    candidate_id='cand-001',
+    note='Symmetric tail orientation accepted for frames 3-8.',
+)
+affected = decision_affected_measurements(project, decision.decision_id, 'hinge_opening')
+withdraw_correspondence_decision(project, decision.decision_id)
+```
+
+撤回会把决定前保存的候选、配对、未匹配原子、歧义分组和确认备注恢复到相关构象，只重新打开这些不确定项；决定历史仍保留且标记为非活动。项目保存时同时写入相对运动分析结果，每个图点包含构象索引/来源、候选 ID、全部采用原子、两个区域实际使用的原子以及适用的人工决定。重新打开项目后可直接从图点回到具体构象和决定，原坐标、历史候选和历史选择不会被覆盖。比较不同稳定参照或不同对应方案会生成独立分析记录，互不覆盖。

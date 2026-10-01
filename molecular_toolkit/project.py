@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import uuid
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -8,6 +10,11 @@ from typing import Any, Sequence
 from .candidates import CorrespondenceCandidate
 from .correspondence import AtomCorrespondence, Pair
 from .ensemble import Conformer, compare_ensemble, save_comparison_report
+from .relative_motion import (
+    CorrespondenceDecision,
+    analyze_relative_motion_series,
+    decision_from_dict,
+)
 from .structures import load_structure
 
 
@@ -79,6 +86,8 @@ class ComparisonProject:
     )
     name: str | None = None
     notes: list[str] = field(default_factory=list)
+    correspondence_decisions: list[CorrespondenceDecision] = field(default_factory=list)
+    relative_motion_analyses: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         normalized_regions: dict[str, dict[str, list[int] | None]] = {}
@@ -114,6 +123,8 @@ class ComparisonProject:
             "conformer_order": [spec.source_path for spec in self.conformers],
             "conformers": [_spec_to_dict(spec) for spec in self.conformers],
             "notes": self.notes,
+            "correspondence_decisions": [decision.to_dict() for decision in self.correspondence_decisions],
+            "relative_motion_analyses": self.relative_motion_analyses,
         }
 
 
@@ -136,6 +147,10 @@ def load_comparison_project(path: str | Path) -> ComparisonProject:
         regions=data.get("regions", {}),
         name=data.get("name"),
         notes=list(data.get("notes", [])),
+        correspondence_decisions=[
+            decision_from_dict(item) for item in data.get("correspondence_decisions", [])
+        ],
+        relative_motion_analyses=dict(data.get("relative_motion_analyses", {})),
     )
 
 
@@ -319,3 +334,157 @@ def _candidate_from_dict(data: dict[str, Any]) -> CorrespondenceCandidate:
         confirmed=bool(data.get("confirmed", False)),
         confirmation_note=data.get("confirmation_note"),
     )
+
+
+def confirm_sequence_correspondence(
+    project: ComparisonProject,
+    start_index: int,
+    end_index: int,
+    *,
+    candidate_id: str | None = None,
+    locked_pairs: Sequence[Pair] | None = None,
+    note: str = "Human review confirmed this sequence correspondence.",
+) -> CorrespondenceDecision:
+    if not (0 <= start_index <= end_index < len(project.conformers)):
+        raise IndexError("Conformer range is outside the saved sequence")
+    locked = list(locked_pairs or [])
+    if candidate_id is None and not locked:
+        raise ValueError("Provide candidate_id or at least one locked pair")
+    decision = CorrespondenceDecision(
+        decision_id=str(uuid.uuid4()),
+        start_index=start_index,
+        end_index=end_index,
+        candidate_id=candidate_id,
+        locked_pairs=locked,
+        note=note,
+    )
+    for index in range(start_index, end_index + 1):
+        spec = project.conformers[index]
+        selected = None
+        previously_confirmed = False
+        if candidate_id is not None:
+            selected = next((item for item in spec.alternatives if item.candidate_id == candidate_id), None)
+        decision.previous_states[str(index)] = {
+            "candidate_id": spec.candidate_id,
+            "pairs": list(spec.pairs),
+            "unmatched_reference": list(spec.unmatched_reference),
+            "unmatched_mobile": list(spec.unmatched_mobile),
+            "ambiguous_identities": deepcopy(spec.ambiguous_identities),
+            "notes": list(spec.notes),
+            "confirmed": previously_confirmed,
+            "confirmation_note": spec.confirmation_note,
+        }
+        if candidate_id is not None:
+            if selected is None:
+                raise ValueError(f"Conformer {index} has no candidate {candidate_id!r}")
+            spec.candidate_id = candidate_id
+            correspondence = selected.to_correspondence()
+        else:
+            correspondence = spec.to_correspondence()
+        pair_set = set(correspondence.pairs)
+        for pair in locked:
+            if pair not in pair_set:
+                raise ValueError(f"Locked pair {pair} is unavailable in conformer {index}")
+        spec.pairs = list(correspondence.pairs)
+        spec.unmatched_reference = list(correspondence.unmatched_reference)
+        spec.unmatched_mobile = list(correspondence.unmatched_mobile)
+        spec.ambiguous_identities = deepcopy(correspondence.ambiguous_identities)
+        spec.confirmed = True
+        spec.confirmation_note = note
+        if "human_confirmed" not in spec.notes:
+            spec.notes.append("human_confirmed")
+        decision.affected_conformer_indices.append(index)
+    project.correspondence_decisions.append(decision)
+    return decision
+
+
+def withdraw_correspondence_decision(
+    project: ComparisonProject, decision_id: str
+) -> CorrespondenceDecision:
+    decision = next(
+        (item for item in reversed(project.correspondence_decisions) if item.decision_id == decision_id),
+        None,
+    )
+    if decision is None:
+        raise KeyError(f"Unknown correspondence decision: {decision_id}")
+    for index in decision.affected_conformer_indices:
+        state = decision.previous_states[str(index)]
+        spec = project.conformers[index]
+        spec.candidate_id = state["candidate_id"]
+        spec.pairs = list(state["pairs"])
+        spec.unmatched_reference = list(state["unmatched_reference"])
+        spec.unmatched_mobile = list(state["unmatched_mobile"])
+        spec.ambiguous_identities = deepcopy(state["ambiguous_identities"])
+        spec.notes = list(state["notes"])
+        spec.confirmed = bool(state["confirmed"])
+        spec.confirmation_note = state["confirmation_note"]
+        if spec.confirmed is False and "human_confirmed" in spec.notes:
+            spec.notes.remove("human_confirmed")
+    decision.active = False
+    return decision
+
+
+def decision_affected_measurements(
+    project: ComparisonProject, decision_id: str, analysis_name: str | None = None
+) -> list[dict[str, Any]]:
+    decision = next(item for item in project.correspondence_decisions if item.decision_id == decision_id)
+    analyses = (
+        {analysis_name: project.relative_motion_analyses[analysis_name]}
+        if analysis_name is not None
+        else project.relative_motion_analyses
+    )
+    affected = set(decision.affected_conformer_indices)
+    results = []
+    for name, saved in analyses.items():
+        for point in saved.get("points", []):
+            index = int(point["conformer_index"])
+            if index in affected:
+                results.append({"analysis": name, **point})
+            elif index - 1 in affected:
+                results.append({"analysis": name, "conformer_index": index, "adjacency": "change_from_affected_previous"})
+    return results
+
+
+def run_relative_motion_project(
+    project: ComparisonProject,
+    analysis_name: str,
+    *,
+    region_a: str,
+    region_b: str,
+    reference_region: str,
+) -> dict[str, Any]:
+    if reference_region not in project.reference_regions:
+        raise ValueError(f"Unknown stable reference region: {reference_region!r}")
+    reference = load_structure(project.reference_path)
+    conformers = [Conformer.from_file(spec.source_path, spec.name) for spec in project.conformers]
+    region_definitions = {
+        name: (value["reference_keys"], value.get("mobile_keys"))
+        for name, value in project.regions.items()
+        if name in {region_a, region_b}
+    }
+    series = analyze_relative_motion_series(
+        reference,
+        conformers,
+        [spec.to_correspondence() for spec in project.conformers],
+        stable_reference_keys=project.reference_regions[reference_region],
+        region_a=region_a,
+        region_b=region_b,
+        region_definitions=region_definitions,
+        alternative_candidates_by_conformer=[spec.alternatives for spec in project.conformers],
+    )
+    series.reference_region = reference_region
+    payload = series.to_dict()
+    payload["analysis_name"] = analysis_name
+    active_decisions = [decision.to_dict() for decision in project.correspondence_decisions if decision.active]
+    for point in payload["points"]:
+        point["active_decisions"] = [
+            {
+                "decision_id": item["decision_id"],
+                "note": item["note"],
+                "range": [item["start_index"], item["end_index"]],
+            }
+            for item in active_decisions
+            if item["start_index"] <= point["conformer_index"] <= item["end_index"]
+        ]
+    project.relative_motion_analyses[analysis_name] = payload
+    return payload

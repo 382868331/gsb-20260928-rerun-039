@@ -8,6 +8,7 @@ import numpy as np
 from molecular_toolkit import (
     Atom,
     ComparisonProject,
+    CorrespondenceCandidate,
     ConformerCorrespondenceSpec,
     ReflectionAlignmentError,
     Structure,
@@ -18,14 +19,18 @@ from molecular_toolkit import (
     compare_conformer,
     Conformer,
     confirm_candidate,
+    confirm_sequence_correspondence,
+    decision_affected_measurements,
     enumerate_candidates,
     load_structure,
     load_comparison_project,
     lock_candidate_pairs,
     match_atoms,
     run_comparison_project,
+    run_relative_motion_project,
     save_comparison_report,
     save_comparison_project,
+    withdraw_correspondence_decision,
 )
 
 
@@ -296,6 +301,161 @@ class EnsembleTests(unittest.TestCase):
         self.assertEqual(record["correspondence_status"], "confirmed")
         self.assertEqual(len(record["alternative_candidates"]), 2)
         self.assertTrue(record["correspondence"]["confirmed"])
+
+
+class RelativeMotionTests(unittest.TestCase):
+    def test_relative_motion_series_reports_ranges_approach_and_local_motion(self):
+        coordinates = np.vstack(
+            [
+                tetra_frame().coordinates[:4],
+                np.array([[2.0, 0.0, 0.0], [2.0, 1.0, 0.0]]),
+                np.array([[0.0, 2.0, 0.0], [1.0, 2.0, 0.0]]),
+                np.array([[2.0, 2.0, 0.0], [3.0, 3.0, 0.0]]),
+            ]
+        )
+        reference = Structure([Atom(i, "C", coordinates[i], serial=i + 1) for i in range(10)])
+        first = Structure([Atom(i, "C", coordinates[i], serial=i + 1) for i in range(10)])
+        closer_coords = coordinates.copy()
+        closer_coords[[6, 7], 0] += 1.0
+        second = Structure([Atom(i, "C", closer_coords[i], serial=i + 1) for i in range(10)])
+        pairs_first = match_atoms(reference, first, explicit_pairs=[(i, i) for i in range(10)])
+        pairs_second = match_atoms(reference, second, explicit_pairs=[(i, i) for i in range(10)])
+        selected = CorrespondenceCandidate("cand-000", pairs_first.pairs, confirmed=True)
+        swapped = CorrespondenceCandidate(
+            "cand-001",
+            [
+                (0, 0), (1, 1), (2, 2), (3, 3),
+                (4, 8), (5, 9), (6, 6), (7, 7), (8, 4), (9, 5),
+            ],
+        )
+        series = __import__(
+            "molecular_toolkit", fromlist=["analyze_relative_motion_series"]
+        ).analyze_relative_motion_series(
+            reference,
+            [Conformer("first", first), Conformer("second", second)],
+            [selected, pairs_second],
+            stable_reference_keys=[0, 1, 2, 3],
+            region_a="a",
+            region_b="b",
+            region_definitions={"a": ([4, 5], None), "b": ([6, 7], None)},
+            alternative_candidates_by_conformer=[[selected, swapped], None],
+        )
+        self.assertAlmostEqual(series.points[0].distance, np.sqrt(4.5), places=9)
+        self.assertAlmostEqual(series.points[0].angle_deg, 90.0, places=9)
+        self.assertEqual(series.points[1].approach, "approaching")
+        self.assertAlmostEqual(series.angle_intervals()[0].lower, 45.0, places=9)
+        self.assertAlmostEqual(series.angle_intervals()[0].upper, 90.0, places=9)
+        self.assertIsNone(series.points[0].region_a.local_rotation_angle)
+        self.assertEqual(series.points[0].region_a.status, "underdetermined_rotation")
+        self.assertIn("adopted_atoms", series.trace_point(0))
+
+    def test_relative_series_intervals_missing_atoms_and_reopen_traceability(self):
+        base = tetra_frame()
+        reference = Structure(
+            [Atom(i, "C", base.coordinates[i], serial=i + 1) for i in range(6)]
+            + [
+                Atom(6, "C", [2.0, 2.0, 0.0], serial=7),
+                Atom(7, "C", [3.0, 3.0, 0.0], serial=8),
+            ]
+        )
+        coords_a = reference.coordinates.copy()
+        coords_a[[4, 5]] += [2.0, 0.0, 0.0]
+        conformer_a = Structure([Atom(i, "C", coords_a[i], serial=i + 1) for i in range(8)])
+        coords_b = reference.coordinates.copy()
+        coords_b[4] += [1.0, 0.0, 0.0]
+        # Atom 5 is absent. Only the available region atom is used; the angle remains null.
+        conformer_b = Structure(
+            [Atom(i, "C", coords_b[i], serial=i + 1) for i in range(5)]
+            + [Atom(5, "C", coords_b[6], serial=7), Atom(6, "C", coords_b[7], serial=8)]
+        )
+        pairs_a = match_atoms(reference, conformer_a, explicit_pairs=[(i, i) for i in range(8)])
+        pairs_b = match_atoms(
+            reference,
+            conformer_b,
+            explicit_pairs=[(i, i) for i in range(5)] + [(6, 5), (7, 6)],
+        )
+        alternative = CorrespondenceCandidate(
+            candidate_id="alt-far",
+            pairs=[
+                (0, 1), (1, 0), (2, 2), (3, 5),
+                (4, 6), (5, 3), (6, 4), (7, 7),
+            ],
+            fit_error="synthetic alternative",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ref_path = root / "reference.xyz"
+            a_path = root / "a.xyz"
+            b_path = root / "b.xyz"
+            project_path = root / "project.json"
+            from molecular_toolkit import save_structure
+
+            save_structure(reference, ref_path)
+            save_structure(conformer_a, a_path)
+            save_structure(conformer_b, b_path)
+            spec_a = ConformerCorrespondenceSpec.from_correspondence(
+                a_path,
+                pairs_a,
+                name="a",
+                candidate_id="auto",
+                alternatives=[
+                    CorrespondenceCandidate(
+                        candidate_id="auto",
+                        pairs=[(i, i) for i in range(8)],
+                        confirmed=True,
+                    ),
+                    alternative,
+                ],
+            )
+            spec_b = ConformerCorrespondenceSpec.from_correspondence(
+                b_path, pairs_b, name="b"
+            )
+            project = ComparisonProject(
+                reference_path=str(ref_path),
+                conformers=[spec_a, spec_b],
+                reference_regions={"core": [0, 1, 2, 3]},
+                regions={
+                    "tail_a": ([4], None),
+                    "tail_b": ([5], None),
+                },
+            )
+            decision = confirm_sequence_correspondence(
+                project, 0, 0, candidate_id="auto", note="Tail mapping reviewed."
+            )
+            affected = decision_affected_measurements(project, decision.decision_id)
+            self.assertEqual(affected, [])
+            payload = run_relative_motion_project(
+                project,
+                "tail_motion",
+                region_a="tail_a",
+                region_b="tail_b",
+                reference_region="core",
+            )
+            affected = decision_affected_measurements(project, decision.decision_id)
+            self.assertEqual([item["conformer_index"] for item in affected], [0, 1])
+            self.assertEqual(affected[1].get("adjacency"), "change_from_affected_previous")
+            self.assertEqual(payload["points"][0]["approach"], None)
+            self.assertEqual(payload["points"][1]["angle_deg"], None)
+            self.assertEqual(payload["points"][1]["region_b"]["status"], "no_available_atoms")
+            self.assertEqual(payload["points"][1]["region_b"]["missing_reference_keys"], [5])
+            interval = payload["distance_intervals"][0]
+            self.assertLessEqual(interval["lower"], interval["selected"])
+            self.assertGreaterEqual(interval["upper"], interval["selected"])
+            self.assertEqual(interval["status"], "ambiguous")
+            self.assertIsNone(payload["angle_intervals"][1]["upper"])
+            self.assertEqual(payload["points"][0]["active_decisions"][0]["decision_id"], decision.decision_id)
+
+            withdraw_correspondence_decision(project, decision.decision_id)
+            self.assertFalse(project.correspondence_decisions[0].active)
+            self.assertFalse(project.conformers[0].confirmed)
+            save_comparison_project(project, project_path)
+            reopened = load_comparison_project(project_path)
+            self.assertEqual(reopened.relative_motion_analyses["tail_motion"]["points"][1]["source_path"], str(b_path))
+            self.assertEqual(
+                reopened.relative_motion_analyses["tail_motion"]["points"][0]["adopted_atoms"][0],
+                {"reference_key": 0, "conformer_key": 0},
+            )
+            self.assertFalse(reopened.correspondence_decisions[0].active)
 
 
 if __name__ == "__main__":

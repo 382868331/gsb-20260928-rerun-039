@@ -28,6 +28,8 @@ class RegionDisplacements:
     internal_vectors: list[list[float]] = field(default_factory=list)
     internal_rmsd_value: float | None = None
     rigid_fit_status: str = "not_fitted"
+    missing_reference_keys: list[int] = field(default_factory=list)
+    missing_mobile_keys: list[int] = field(default_factory=list)
 
     @property
     def rmsd(self) -> float:
@@ -87,6 +89,8 @@ class RegionDisplacements:
             "internal_distances": self.internal_distances,
             "internal_vectors": self.internal_vectors,
             "rigid_fit_status": self.rigid_fit_status,
+            "missing_reference_keys": self.missing_reference_keys,
+            "missing_mobile_keys": self.missing_mobile_keys,
             "per_atom": per_atom,
         }
 
@@ -196,7 +200,10 @@ def align_on_stable_atoms(
                 name, ref_keys, mobile_keys, reference, mobile, pair_map
             )
             assigned_pairs.update(region_pairs)
-            result.regions[name] = _measure_region(name, reference, aligned_mobile, region_pairs)
+            measured = _measure_region(name, reference, aligned_mobile, region_pairs)
+            measured.missing_reference_keys = [key for key in ref_keys if key not in {pair[0] for pair in region_pairs}]
+            measured.missing_mobile_keys = [key for key in (mobile_keys or []) if key not in {pair[1] for pair in region_pairs}]
+            result.regions[name] = measured
 
     remaining = [pair for pair in pairs if pair not in assigned_pairs]
     if remaining:
@@ -252,20 +259,17 @@ def _normalize_region(value: tuple[AtomKeys, AtomKeys | None]):
 def _resolve_region_pairs(name, ref_keys, mobile_keys, reference, mobile, pair_map):
     ref_keys = _validate_keys(ref_keys, reference, f"region {name!r} reference")
     if mobile_keys is None:
-        missing = [key for key in ref_keys if key not in pair_map]
-        if missing:
-            raise ValueError(f"Region {name!r} atoms lack correspondence: {missing}")
-        return [(key, pair_map[key]) for key in ref_keys]
+        available = [key for key in ref_keys if key in pair_map]
+        return [(key, pair_map[key]) for key in available]
     mobile_keys = _validate_keys(mobile_keys, mobile, f"region {name!r} mobile")
     if len(ref_keys) != len(mobile_keys):
         raise ValueError(f"Region {name!r} reference and mobile atom counts differ")
     pairs = list(zip(ref_keys, mobile_keys))
+    valid_pairs = []
     for ref_key, mobile_key in pairs:
-        if pair_map.get(ref_key, mobile_key) != mobile_key:
-            raise ValueError(
-                f"Region {name!r} pair ({ref_key}, {mobile_key}) conflicts with correspondence"
-            )
-    return pairs
+        if pair_map.get(ref_key) == mobile_key:
+            valid_pairs.append((ref_key, mobile_key))
+    return valid_pairs
 
 
 def _validate_keys(keys, structure, label):
@@ -278,6 +282,13 @@ def _validate_keys(keys, structure, label):
 
 
 def _measure_region(name, reference, aligned_mobile, pairs):
+    if not pairs:
+        return RegionDisplacements(
+            name=name,
+            reference_keys=[],
+            mobile_keys=[],
+            rigid_fit_status="no_available_atoms",
+        )
     distances = []
     vectors = []
     for ref_key, mobile_key in pairs:
