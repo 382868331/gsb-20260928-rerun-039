@@ -9,6 +9,9 @@ from molecular_toolkit import (
     Atom,
     ComparisonProject,
     ConformerCorrespondenceSpec,
+    RelativeMotionSeries,
+    analyze_relative_motion,
+    confirm_project_correspondence,
     ReflectionAlignmentError,
     Structure,
     align_on_stable_atoms,
@@ -24,6 +27,8 @@ from molecular_toolkit import (
     lock_candidate_pairs,
     match_atoms,
     run_comparison_project,
+    save_structure,
+    withdraw_project_correspondence,
     save_comparison_report,
     save_comparison_project,
 )
@@ -296,6 +301,117 @@ class EnsembleTests(unittest.TestCase):
         self.assertEqual(record["correspondence_status"], "confirmed")
         self.assertEqual(len(record["alternative_candidates"]), 2)
         self.assertTrue(record["correspondence"]["confirmed"])
+
+    def test_relative_motion_keeps_missing_angle_as_null_and_records_atoms(self):
+        coordinates = np.vstack(
+            [
+                tetra_frame().coordinates[:4],
+                np.array([[2.0, 0.0, 0.0], [2.0, 1.0, 0.0], [2.0, 0.0, 1.0]]),
+                np.array([[4.0, 0.0, 0.0], [4.0, 1.0, 0.0], [4.0, 0.0, 1.0]]),
+            ]
+        )
+        reference = Structure([Atom(i, "C", coordinates[i], serial=i + 1) for i in range(10)])
+        first_coords = np.delete(reference.coordinates, 4, axis=0)
+        first = Structure([Atom(i, "C", first_coords[i], serial=i + 1) for i in range(9)])
+        second_coords = reference.coordinates.copy()
+        second_coords[6:9, 0] -= 0.5
+        second = Structure([Atom(i, "C", second_coords[i], serial=i + 1) for i in range(10)])
+        pairs_first = match_atoms(
+            reference, first, explicit_pairs=[(0, 0), (1, 1), (2, 2), (3, 3), (5, 4), (6, 5), (7, 6), (8, 7)]
+        )
+        pairs_second = match_atoms(reference, second, explicit_pairs=[(i, i) for i in range(10)])
+        conformers = [Conformer("first", first), Conformer("second", second)]
+        comparisons = compare_ensemble(
+            reference,
+            list(zip(conformers, [pairs_first, pairs_second])),
+            stable_reference_keys=[0, 1, 2, 3],
+            regions={"left": ([4, 5], None), "right": ([6, 7, 8], None)},
+        )
+
+        series = analyze_relative_motion(comparisons, "left", "right", reference_region="core")
+
+        self.assertIsInstance(series, RelativeMotionSeries)
+        self.assertIsNone(series.points[0].angle_deg)
+        self.assertEqual(series.points[0].angle_status, "missing_atoms")
+        self.assertIsNotNone(series.points[0].distance)
+        self.assertEqual(series.points[0].atom_pairs["left"], [[5, 4]])
+        self.assertEqual(series.points[1].motion_state, "approaching")
+        self.assertIsNotNone(series.points[1].angle_deg)
+
+    def test_project_saves_relative_motion_and_limited_correspondence_withdrawal(self):
+        reference_coords = np.vstack(
+            [
+                tetra_frame().coordinates[:4],
+                np.array([[2.0, 0.0, 0.0], [2.0, 1.0, 0.0]]),
+                np.array([[4.0, 0.0, 0.0], [4.0, 1.0, 0.0]]),
+            ]
+        )
+        reference = Structure(
+            [Atom(i, "C", reference_coords[i], serial=(1, 2, 3, 4, 9, 9, 7, 8)[i]) for i in range(8)]
+        )
+        swapped = reference.coordinates.copy()
+        swapped[[4, 5]] = swapped[[5, 4]]
+        ambiguous = Structure(
+            [Atom(i, "C", swapped[i], serial=(1, 2, 3, 4, 9, 9, 7, 8)[i]) for i in range(8)]
+        )
+        clear_mobile = Structure(
+            [Atom(i, "C", reference.atom(i).xyz + [0.0, 0.0, 0.2], serial=(1, 2, 3, 4, 9, 9, 7, 8)[i])
+             for i in range(8)]
+        )
+        candidates = candidates_from_identity(reference, ambiguous)
+        clear_pairs = match_atoms(reference, clear_mobile, explicit_pairs=[(i, i) for i in range(8)])
+
+        with tempfile.TemporaryDirectory() as directory:
+            ref_path = Path(directory) / "reference.xyz"
+            amb_path = Path(directory) / "ambiguous.xyz"
+            clear_path = Path(directory) / "clear.xyz"
+            project_path = Path(directory) / "project.json"
+            save_structure(reference, ref_path)
+            save_structure(ambiguous, amb_path)
+            save_structure(clear_mobile, clear_path)
+            project = ComparisonProject(
+                reference_path=str(ref_path),
+                conformers=[
+                    ConformerCorrespondenceSpec.from_correspondence(
+                        amb_path,
+                        candidates[1].to_correspondence(),
+                        name="ambiguous",
+                        alternatives=candidates,
+                    ),
+                    ConformerCorrespondenceSpec.from_correspondence(
+                        clear_path, clear_pairs, name="clear"
+                    ),
+                ],
+                reference_regions={"core": [0, 1, 2, 3]},
+                regions={"left": ([4, 5], None), "right": ([6, 7], None)},
+                relative_motion_pairs=[["left", "right"]],
+            )
+
+            decision = confirm_project_correspondence(project, 0, 0, candidate_id=candidates[0].candidate_id)
+            self.assertEqual(decision["affected_point_indices"], [0])
+            self.assertEqual(decision["affected_segment_indices"], [0])
+            save_comparison_project(project, project_path)
+            reopened = load_comparison_project(project_path)
+            run_comparison_project(reopened, report_directory=Path(directory) / "reports")
+            motion = json.loads(
+                (
+                    Path(directory)
+                    / "reports"
+                    / "core"
+                    / "relative_motion"
+                    / "left__right.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(motion["points"][0]["candidate_id"], candidates[0].candidate_id)
+            self.assertEqual(motion["points"][0]["decision_id"], "decision-001")
+            self.assertEqual(motion["points"][0]["correspondence_status"], "confirmed")
+            self.assertEqual(motion["points"][0]["atom_pairs"]["left"], [[4, 5], [5, 4]])
+
+            withdraw_project_correspondence(reopened, "decision-001")
+            self.assertFalse(reopened.conformers[0].confirmed)
+            self.assertIsNone(reopened.conformers[0].candidate_id)
+            self.assertTrue(reopened.conformers[1].confirmed)
+            self.assertEqual(reopened.correspondence_decisions[-1]["status"], "withdrawn")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from typing import Any, Sequence
 from .candidates import CorrespondenceCandidate
 from .correspondence import AtomCorrespondence, Pair
 from .ensemble import Conformer, compare_ensemble, save_comparison_report
+from .relative_motion import analyze_relative_motion, correspondence_decision_impact, save_relative_motion_report
 from .structures import load_structure
 
 
@@ -68,6 +69,14 @@ class ConformerCorrespondenceSpec:
             confirmation_note=self.confirmation_note,
         )
 
+    def selected_candidate(self) -> CorrespondenceCandidate | None:
+        if self.candidate_id is None:
+            return None
+        return next(
+            (item for item in self.alternatives if item.candidate_id == self.candidate_id),
+            None,
+        )
+
 
 @dataclass(eq=False)
 class ComparisonProject:
@@ -79,6 +88,8 @@ class ComparisonProject:
     )
     name: str | None = None
     notes: list[str] = field(default_factory=list)
+    relative_motion_pairs: list[list[str]] = field(default_factory=list)
+    correspondence_decisions: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         normalized_regions: dict[str, dict[str, list[int] | None]] = {}
@@ -113,6 +124,8 @@ class ComparisonProject:
             },
             "conformer_order": [spec.source_path for spec in self.conformers],
             "conformers": [_spec_to_dict(spec) for spec in self.conformers],
+            "relative_motion_pairs": [list(pair) for pair in self.relative_motion_pairs],
+            "correspondence_decisions": self.correspondence_decisions,
             "notes": self.notes,
         }
 
@@ -136,6 +149,8 @@ def load_comparison_project(path: str | Path) -> ComparisonProject:
         regions=data.get("regions", {}),
         name=data.get("name"),
         notes=list(data.get("notes", [])),
+        relative_motion_pairs=[list(pair) for pair in data.get("relative_motion_pairs", [])],
+        correspondence_decisions=list(data.get("correspondence_decisions", [])),
     )
 
 
@@ -154,7 +169,15 @@ def run_comparison_project(
     for reference_name, stable_keys in project.reference_regions.items():
         comparisons = compare_ensemble(
             reference,
-            list(zip(loaded_conformers, [spec.to_correspondence() for spec in project.conformers])),
+            list(
+                zip(
+                    loaded_conformers,
+                    [
+                        spec.selected_candidate() or spec.to_correspondence()
+                        for spec in project.conformers
+                    ],
+                )
+            ),
             stable_keys,
             region_args,
             alternative_candidates_by_conformer=[spec.alternatives for spec in project.conformers],
@@ -171,7 +194,102 @@ def run_comparison_project(
             )
     if report_directory is not None:
         save_reference_region_summary(runs, Path(report_directory) / "reference_region_summary.json")
+        _save_project_relative_motion_reports(project, runs, reference, region_args, Path(report_directory))
     return runs
+
+
+def confirm_project_correspondence(
+    project: ComparisonProject,
+    start_index: int,
+    end_index: int,
+    *,
+    candidate_id: str | None = None,
+    note: str = "Human review confirmed this correspondence range.",
+) -> dict[str, Any]:
+    """Confirm correspondences for a contiguous range while retaining history."""
+    impact = correspondence_decision_impact(len(project.conformers), start_index, end_index)
+    decision_id = f"decision-{len(project.correspondence_decisions) + 1:03d}"
+    selected_sources = []
+    for index in range(start_index, end_index + 1):
+        spec = project.conformers[index]
+        if candidate_id is not None:
+            selected = next((item for item in spec.alternatives if item.candidate_id == candidate_id), None)
+            if selected is None:
+                raise ValueError(f"Conformer {index} has no candidate {candidate_id!r}")
+            spec.candidate_id = candidate_id
+            selected.confirmed = True
+            selected.confirmation_note = note
+        spec.confirmed = True
+        spec.confirmation_note = note
+        selected_sources.append(spec.source_path)
+    decision = {
+        "decision_id": decision_id,
+        "status": "active",
+        "start_index": start_index,
+        "end_index": end_index,
+        "conformer_sources": selected_sources,
+        "candidate_id": candidate_id,
+        "note": note,
+        **impact,
+    }
+    project.correspondence_decisions.append(decision)
+    return decision
+
+
+def withdraw_project_correspondence(project: ComparisonProject, decision_id: str) -> dict[str, Any]:
+    """Reopen only uncertainty covered by the named active decision."""
+    decision = next(
+        (item for item in project.correspondence_decisions if item.get("decision_id") == decision_id),
+        None,
+    )
+    if decision is None:
+        raise KeyError(f"Unknown correspondence decision {decision_id!r}")
+    if decision.get("status") != "active":
+        raise ValueError(f"Correspondence decision {decision_id!r} is not active")
+    for index in range(decision["start_index"], decision["end_index"] + 1):
+        spec = project.conformers[index]
+        if spec.alternatives:
+            spec.confirmed = False
+            spec.confirmation_note = None
+            spec.candidate_id = None
+    withdrawal = {
+        **decision,
+        "status": "withdrawn",
+        "withdrawn_decision_id": decision_id,
+        "decision_id": f"decision-{len(project.correspondence_decisions) + 1:03d}",
+    }
+    decision["status"] = "withdrawn"
+    project.correspondence_decisions.append(withdrawal)
+    return withdrawal
+
+
+def _save_project_relative_motion_reports(project, runs, reference, region_args, report_directory):
+    for region_names in project.relative_motion_pairs:
+        if len(region_names) != 2:
+            raise ValueError("Each relative motion entry must contain two region names")
+        first, second = region_names
+        decision_by_source = {
+            source: decision["decision_id"]
+            for decision in project.correspondence_decisions
+            if decision.get("status") == "active"
+            for source in decision.get("conformer_sources", [])
+        }
+        for reference_name, comparisons in runs.items():
+            series = analyze_relative_motion(
+                comparisons,
+                first,
+                second,
+                reference_region=reference_name,
+                reference=reference,
+                stable_reference_keys=project.reference_regions[reference_name],
+                region_definitions=region_args,
+                decision_by_source=decision_by_source,
+            )
+            filename = f"{first}__{second}.json".replace("/", "_")
+            save_relative_motion_report(
+                series,
+                report_directory / reference_name / "relative_motion" / filename,
+            )
 
 
 def save_reference_region_summary(runs: dict[str, list], path: str | Path) -> None:

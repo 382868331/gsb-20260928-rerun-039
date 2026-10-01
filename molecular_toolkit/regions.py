@@ -252,10 +252,7 @@ def _normalize_region(value: tuple[AtomKeys, AtomKeys | None]):
 def _resolve_region_pairs(name, ref_keys, mobile_keys, reference, mobile, pair_map):
     ref_keys = _validate_keys(ref_keys, reference, f"region {name!r} reference")
     if mobile_keys is None:
-        missing = [key for key in ref_keys if key not in pair_map]
-        if missing:
-            raise ValueError(f"Region {name!r} atoms lack correspondence: {missing}")
-        return [(key, pair_map[key]) for key in ref_keys]
+        return [(key, pair_map[key]) for key in ref_keys if key in pair_map]
     mobile_keys = _validate_keys(mobile_keys, mobile, f"region {name!r} mobile")
     if len(ref_keys) != len(mobile_keys):
         raise ValueError(f"Region {name!r} reference and mobile atom counts differ")

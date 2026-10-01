@@ -23,6 +23,15 @@ from .project import (
     run_comparison_project,
     save_comparison_project,
     save_reference_region_summary,
+    confirm_project_correspondence,
+    withdraw_project_correspondence,
+)
+from .relative_motion import (
+    RelativeMotionPoint,
+    RelativeMotionSeries,
+    analyze_relative_motion,
+    correspondence_decision_impact,
+    save_relative_motion_report,
 )
 from .regions import (
     RegionAlignmentResult,
@@ -62,6 +71,13 @@ __all__ = [
     "save_comparison_project",
     "save_reference_region_summary",
     "reference_region_differences",
+    "confirm_project_correspondence",
+    "withdraw_project_correspondence",
+    "RelativeMotionPoint",
+    "RelativeMotionSeries",
+    "analyze_relative_motion",
+    "correspondence_decision_impact",
+    "save_relative_motion_report",
     "AlignmentResult",
     "align_structures",
     "save_alignment",

@@ -143,3 +143,31 @@ runs = run_comparison_project(reopened, report_directory="reports")
 ```
 
 `run_comparison_project` 会按保存的构象顺序分别为每个参照区域重算一份报告；`reports/reference_region_summary.json` 对相同局部区域在不同参照下的总 RMSD、平移、旋转和内部形变差值进行汇总。缺失原子继续保留为未匹配；等价原子交换的所有候选及人工锁定/确认状态随项目保存，重新打开后不需要重新猜测。
+
+## 柔性区域的相对运动序列
+
+需要分析两个柔性区域之间的相对运动时，在项目中设置 `relative_motion_pairs`。运行项目后，每个参照区域目录下都会生成 `relative_motion/区域A__区域B.json`，按保存的构象顺序记录：
+
+- 两区域中心的距离、相对前一构象的距离变化，以及 `approaching`、`separating` 或 `stable`；
+- 两区域主轴夹角；原子不足或几何退化时为 `null`，并通过 `angle_status` 说明原因，不会填成零；
+- 多候选对应在当前测量上的 `distance_range`、`angle_range`，保留不同解释的结果区间；
+- 各区域相对当前稳定参照的平移、旋转和内部形变 RMSD，避免把更换参照造成的整体变化解释成区域内部变形；
+- 每个点的构象名称、源路径、实际采用的原子对、候选 ID 和人工决定 ID。
+
+人工可确认一个连续区间的对应关系；函数会返回受影响的点和相邻变化线段。撤回时只把该区间中仍有候选的不确定项重新打开，并追加一条撤回记录，不覆盖原决定历史：
+
+```python
+from molecular_toolkit import confirm_project_correspondence, withdraw_project_correspondence
+
+decision = confirm_project_correspondence(
+    project,
+    start_index=3,
+    end_index=7,
+    candidate_id="cand-001",
+    note="Accepted swapped-domain interpretation.",
+)
+decision["affected_segment_indices"]  # 包含区间边界处会改变的相邻测量
+withdraw_project_correspondence(project, decision["decision_id"])
+```
+
+重开项目并重新运行时，原始坐标不会被改写；不同参照区域的结果分目录保存，人工确认、撤回、候选方案和每一点的采用原子都可从 JSON 报告追溯。
