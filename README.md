@@ -171,3 +171,54 @@ withdraw_project_correspondence(project, decision["decision_id"])
 ```
 
 重开项目并重新运行时，原始坐标不会被改写；不同参照区域的结果分目录保存，人工确认、撤回、候选方案和每一点的采用原子都可从 JSON 报告追溯。
+
+## 区域接触的形成、持续与失去
+
+除区域中心距离曲线外，还可以在项目中配置多对区域接触，并为每对分别给出进入和解除距离。距离取两区域原子间的最小距离（例如最近的一对侧链原子），每个构象都记录这对实际采用的原子，因此每个接触点、事件和持续区间都能回到具体证据：
+
+```python
+project.contact_pairs = [
+    {"regions": ["left", "right"], "enter_distance": 5.0, "exit_distance": 6.0},
+]
+run_comparison_project(project, report_directory="reports")
+# reports/contacts/left__right.json
+```
+
+### 迟滞避免阈值抖动
+
+接触只在距离 `<= enter_distance` 时形成，只在距离 `> exit_distance` 时解除；两阈值之间保持原状态。距离在单一阈值附近往返时不会反复制造大量 `contact_formed` / `contact_lost` 事件。`enter_distance` 不允许大于 `exit_distance`。
+
+### 缺失原子与解释分歧
+
+- 某构象缺少接触所需原子时，该点状态为 `missing`，距离为 `null`，并在 `missing_reference_keys` 中列出缺少的区域原子；这不是接触解除。
+- 多套对应候选分别支持接触与不接触时，状态为 `disputed`，`interpretations` 同时保留每套解释的候选 ID、距离、最近原子对和 `contact_support`。
+- `missing` 和 `disputed` 都会发出 `contact_interrupted` 并把持续区间断开，缺失前后的两段不会被算成一个完整连续接触。
+- 接触距离在每个构象自身坐标内测量，刚体参照（稳定参照区域）的改变只会产生相同的平移/旋转，不会凭空改变真实区域间接触。
+
+### 持续区间统计与溯源
+
+每个 episode 记录 `start_index`、`end_index`、`point_indices`、结束原因（`separated`、`missing`、`disputed`、`sequence_end`），并区分：
+
+- `observed_frame_count`：由观测直接支持的构象数；
+- `confirmed_frame_count`：人工确认对应关系后才成立的构象数。
+
+每个点同时保存构象名称、源路径、最近原子对、两区域完整原子对、候选 ID 和决定 ID，可从任意统计回溯到坐标证据。整区域原子缺失时区域测量返回 `rigid_fit_status: missing_atoms` 而不是崩溃。
+
+### 决定预览、确认与撤回
+
+确认一段对应关系前可以先预览哪些接触事件和持续时间会改变，预览不修改项目：
+
+```python
+preview = preview_project_contact_decision(
+    project,
+    start_index=3,
+    end_index=7,
+    candidate_id="cand-001",
+    region_pair=["left", "right"],
+)
+preview["left__right"]["before"]["state_sequence"]
+preview["left__right"]["after"]["state_sequence"]
+preview["left__right"]["events_added"]
+```
+
+确认后分歧点按所选解释判为接触/分离，备注说明此前存在分歧，事件中的 `decision_id` 标记它由人工确认成立。撤回只重新打开该区间内仍有候选的不确定项：原坐标和历史决定（含撤回记录）保持可追溯，重开后相关区间重新回到 `disputed` / `missing` 统计。

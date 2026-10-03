@@ -6,6 +6,12 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .candidates import CorrespondenceCandidate
+from .contacts import (
+    ContactThresholds,
+    analyze_contact_persistence,
+    contact_decision_preview,
+    save_contact_persistence_report,
+)
 from .correspondence import AtomCorrespondence, Pair
 from .ensemble import Conformer, compare_ensemble, save_comparison_report
 from .relative_motion import analyze_relative_motion, correspondence_decision_impact, save_relative_motion_report
@@ -89,6 +95,7 @@ class ComparisonProject:
     name: str | None = None
     notes: list[str] = field(default_factory=list)
     relative_motion_pairs: list[list[str]] = field(default_factory=list)
+    contact_pairs: list[dict[str, Any]] = field(default_factory=list)
     correspondence_decisions: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -125,6 +132,7 @@ class ComparisonProject:
             "conformer_order": [spec.source_path for spec in self.conformers],
             "conformers": [_spec_to_dict(spec) for spec in self.conformers],
             "relative_motion_pairs": [list(pair) for pair in self.relative_motion_pairs],
+            "contact_pairs": [dict(pair) for pair in self.contact_pairs],
             "correspondence_decisions": self.correspondence_decisions,
             "notes": self.notes,
         }
@@ -150,6 +158,7 @@ def load_comparison_project(path: str | Path) -> ComparisonProject:
         name=data.get("name"),
         notes=list(data.get("notes", [])),
         relative_motion_pairs=[list(pair) for pair in data.get("relative_motion_pairs", [])],
+        contact_pairs=[dict(pair) for pair in data.get("contact_pairs", [])],
         correspondence_decisions=list(data.get("correspondence_decisions", [])),
     )
 
@@ -195,6 +204,7 @@ def run_comparison_project(
     if report_directory is not None:
         save_reference_region_summary(runs, Path(report_directory) / "reference_region_summary.json")
         _save_project_relative_motion_reports(project, runs, reference, region_args, Path(report_directory))
+        _save_project_contact_reports(project, runs, reference, region_args, Path(report_directory))
     return runs
 
 
@@ -290,6 +300,152 @@ def _save_project_relative_motion_reports(project, runs, reference, region_args,
                 series,
                 report_directory / reference_name / "relative_motion" / filename,
             )
+
+
+def analyze_project_contacts(project: ComparisonProject) -> dict:
+    """Run contact persistence for every configured ``contact_pairs`` entry.
+
+    Contact distance is measured inside each conformer's own coordinates, so
+    the same trace is valid regardless of which stable reference region was
+    used for alignment; the first reference region's comparisons are reused.
+    """
+    reference = load_structure(project.reference_path)
+    conformers = [Conformer.from_file(spec.source_path, spec.name) for spec in project.conformers]
+    region_args = {
+        name: (value["reference_keys"], value.get("mobile_keys"))
+        for name, value in project.regions.items()
+    }
+    reference_name = next(iter(project.reference_regions))
+    comparisons = compare_ensemble(
+        reference,
+        list(
+            zip(
+                conformers,
+                [spec.selected_candidate() or spec.to_correspondence() for spec in project.conformers],
+            )
+        ),
+        project.reference_regions[reference_name],
+        region_args,
+        alternative_candidates_by_conformer=[spec.alternatives for spec in project.conformers],
+    )
+    decision_by_source = _active_decisions_by_source(project)
+    traces = {}
+    for entry in project.contact_pairs:
+        first, second = _contact_pair_names(entry)
+        thresholds = _contact_thresholds(entry)
+        traces[f"{first}__{second}"] = analyze_contact_persistence(
+            comparisons,
+            first,
+            second,
+            thresholds,
+            reference=reference,
+            stable_reference_keys=project.reference_regions[reference_name],
+            region_definitions=region_args,
+            decision_by_source=decision_by_source,
+            resolved_sources=set(decision_by_source),
+        )
+    return traces
+
+
+def preview_project_contact_decision(
+    project: ComparisonProject,
+    start_index: int,
+    end_index: int,
+    *,
+    candidate_id: str | None = None,
+    region_pair: Sequence[str] | None = None,
+) -> dict:
+    """Preview contact event/duration changes without mutating the project."""
+    reference = load_structure(project.reference_path)
+    conformers = [Conformer.from_file(spec.source_path, spec.name) for spec in project.conformers]
+    region_args = {
+        name: (value["reference_keys"], value.get("mobile_keys"))
+        for name, value in project.regions.items()
+    }
+    reference_name = next(iter(project.reference_regions))
+    comparisons = compare_ensemble(
+        reference,
+        list(
+            zip(
+                conformers,
+                [spec.selected_candidate() or spec.to_correspondence() for spec in project.conformers],
+            )
+        ),
+        project.reference_regions[reference_name],
+        region_args,
+        alternative_candidates_by_conformer=[spec.alternatives for spec in project.conformers],
+    )
+    entries = project.contact_pairs
+    if region_pair is not None:
+        wanted = list(region_pair)
+        entries = [entry for entry in entries if list(_contact_pair_names(entry)) == wanted]
+        if not entries:
+            raise KeyError(f"No configured contact pair {wanted!r}")
+    previews = {}
+    for entry in entries:
+        first, second = _contact_pair_names(entry)
+        previews[f"{first}__{second}"] = contact_decision_preview(
+            comparisons,
+            first,
+            second,
+            _contact_thresholds(entry),
+            start_index,
+            end_index,
+            candidate_id,
+            reference=reference,
+            stable_reference_keys=project.reference_regions[reference_name],
+            region_definitions=region_args,
+            decision_by_source=_active_decisions_by_source(project),
+            resolved_sources=set(_active_decisions_by_source(project)),
+        )
+    return previews
+
+
+def _save_project_contact_reports(project, runs, reference, region_args, report_directory):
+    reference_name = next(iter(runs))
+    comparisons = runs[reference_name]
+    decision_by_source = _active_decisions_by_source(project)
+    contact_directory = report_directory / "contacts"
+    for entry in project.contact_pairs:
+        first, second = _contact_pair_names(entry)
+        trace = analyze_contact_persistence(
+            comparisons,
+            first,
+            second,
+            _contact_thresholds(entry),
+            reference=reference,
+            stable_reference_keys=project.reference_regions[reference_name],
+            region_definitions=region_args,
+            decision_by_source=decision_by_source,
+            resolved_sources=set(decision_by_source),
+        )
+        filename = f"{first}__{second}.json".replace("/", "_")
+        save_contact_persistence_report(trace, contact_directory / filename)
+
+
+def _active_decisions_by_source(project: ComparisonProject) -> dict[str, str]:
+    return {
+        source: decision["decision_id"]
+        for decision in project.correspondence_decisions
+        if decision.get("status") == "active"
+        for source in decision.get("conformer_sources", [])
+    }
+
+
+def _contact_pair_names(entry: dict[str, Any]) -> tuple[str, str]:
+    regions = entry.get("regions")
+    if not regions or len(regions) != 2:
+        raise ValueError("Each contact pair entry must contain two region names")
+    return str(regions[0]), str(regions[1])
+
+
+def _contact_thresholds(entry: dict[str, Any]) -> ContactThresholds:
+    if "enter_distance" not in entry or "exit_distance" not in entry:
+        raise ValueError("Each contact pair entry requires enter_distance and exit_distance")
+    return ContactThresholds(
+        enter_distance=entry["enter_distance"],
+        exit_distance=entry["exit_distance"],
+    )
 
 
 def save_reference_region_summary(runs: dict[str, list], path: str | Path) -> None:
