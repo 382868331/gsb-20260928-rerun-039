@@ -15,6 +15,14 @@ from .ensemble import (
     save_comparison_report,
 )
 from .geometry import GeometryError, ReflectionAlignmentError, angle, dihedral, distance, kabsch, rmsd
+from .contacts import (
+    ContactAnalysis,
+    ContactRule,
+    analyze_contacts,
+    contact_analyses_for_series,
+    contact_decision_preview,
+    save_contact_analysis,
+)
 from .project import (
     ComparisonProject,
     ConformerCorrespondenceSpec,
@@ -24,6 +32,7 @@ from .project import (
     save_comparison_project,
     save_reference_region_summary,
     confirm_project_correspondence,
+    preview_project_correspondence_contact_impact,
     withdraw_project_correspondence,
 )
 from .relative_motion import (
@@ -78,6 +87,13 @@ __all__ = [
     "analyze_relative_motion",
     "correspondence_decision_impact",
     "save_relative_motion_report",
+    "ContactRule",
+    "ContactAnalysis",
+    "analyze_contacts",
+    "contact_analyses_for_series",
+    "contact_decision_preview",
+    "save_contact_analysis",
+    "preview_project_correspondence_contact_impact",
     "AlignmentResult",
     "align_structures",
     "save_alignment",

@@ -42,6 +42,7 @@ class RelativeMotionPoint:
     correspondence_status: str
     available_interpretations: int
     decision_id: str | None = None
+    alternative_measurements: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -73,6 +74,7 @@ class RelativeMotionPoint:
             "correspondence_status": self.correspondence_status,
             "available_interpretations": self.available_interpretations,
             "decision_id": self.decision_id,
+            "alternative_measurements": self.alternative_measurements,
         }
 
 
@@ -137,7 +139,12 @@ def analyze_relative_motion(
                     region_definitions,
                     alternative_candidates=alternatives,
                 )
-                measurements.append(_measurement(alternative, region_a, region_b))
+                alternative_measurement = _measurement(alternative, region_a, region_b)
+                alternative_measurement["candidate_id"] = alternative.candidate_id
+                alternative_measurement["correspondence_status"] = alternative.correspondence_status
+                measurements.append(alternative_measurement)
+        selected["candidate_id"] = comparison.candidate_id
+        selected["correspondence_status"] = comparison.correspondence_status
 
         distance = selected["distance"]
         change = None if distance is None or previous_distance is None else distance - previous_distance
@@ -173,6 +180,7 @@ def analyze_relative_motion(
                 correspondence_status=comparison.correspondence_status,
                 available_interpretations=len(measurements),
                 decision_id=decisions.get(source or ""),
+                alternative_measurements=[_measurement_summary(item) for item in measurements],
             )
         )
         if distance is not None:
@@ -216,6 +224,15 @@ def _measurement(comparison: ConformerComparison, name_a: str, name_b: str) -> d
             name_a: [[int(ref), int(mob)] for ref, mob in zip(region_a.reference_keys, region_a.mobile_keys)],
             name_b: [[int(ref), int(mob)] for ref, mob in zip(region_b.reference_keys, region_b.mobile_keys)],
         },
+    }
+
+
+def _measurement_summary(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "candidate_id": value.get("candidate_id"),
+        "correspondence_status": value.get("correspondence_status"),
+        "distance": value["distance"],
+        "atom_pairs": value["pairs"],
     }
 
 

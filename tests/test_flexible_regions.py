@@ -7,9 +7,12 @@ import numpy as np
 
 from molecular_toolkit import (
     Atom,
+    ContactRule,
     ComparisonProject,
     ConformerCorrespondenceSpec,
     RelativeMotionSeries,
+    RelativeMotionPoint,
+    analyze_contacts,
     analyze_relative_motion,
     confirm_project_correspondence,
     ReflectionAlignmentError,
@@ -31,6 +34,7 @@ from molecular_toolkit import (
     withdraw_project_correspondence,
     save_comparison_report,
     save_comparison_project,
+    preview_project_correspondence_contact_impact,
 )
 
 
@@ -385,8 +389,23 @@ class EnsembleTests(unittest.TestCase):
                 reference_regions={"core": [0, 1, 2, 3]},
                 regions={"left": ([4, 5], None), "right": ([6, 7], None)},
                 relative_motion_pairs=[["left", "right"]],
+                contact_rules=[
+                    {
+                        "region_a": "left",
+                        "region_b": "right",
+                        "enter_distance": 3.0,
+                        "exit_distance": 4.0,
+                        "min_contact_duration": 1,
+                    }
+                ],
             )
 
+            preview = preview_project_correspondence_contact_impact(
+                project, 0, 0, candidate_id=candidates[0].candidate_id
+            )
+            self.assertEqual(len(preview["previews"]), 1)
+            self.assertIn("before", preview["previews"][0])
+            self.assertIn("after", preview["previews"][0])
             decision = confirm_project_correspondence(project, 0, 0, candidate_id=candidates[0].candidate_id)
             self.assertEqual(decision["affected_point_indices"], [0])
             self.assertEqual(decision["affected_segment_indices"], [0])
@@ -406,12 +425,151 @@ class EnsembleTests(unittest.TestCase):
             self.assertEqual(motion["points"][0]["decision_id"], "decision-001")
             self.assertEqual(motion["points"][0]["correspondence_status"], "confirmed")
             self.assertEqual(motion["points"][0]["atom_pairs"]["left"], [[4, 5], [5, 4]])
+            contacts = json.loads(
+                (
+                    Path(directory)
+                    / "reports"
+                    / "core"
+                    / "contacts"
+                    / "left__right__3__4__min1.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(contacts["format"], "molecular-toolkit-contact-analysis")
+            self.assertEqual(contacts["points"][0]["atom_pairs"]["left"], [[4, 5], [5, 4]])
+            self.assertEqual(contacts["points"][0]["decision_id"], "decision-001")
 
             withdraw_project_correspondence(reopened, "decision-001")
             self.assertFalse(reopened.conformers[0].confirmed)
             self.assertIsNone(reopened.conformers[0].candidate_id)
             self.assertTrue(reopened.conformers[1].confirmed)
             self.assertEqual(reopened.correspondence_decisions[-1]["status"], "withdrawn")
+
+    def test_contact_hysteresis_minimum_duration_and_missing_gap_segments(self):
+        series = self._contact_series(
+            [
+                (1.0, None, None),
+                (None, None, None),
+                (1.0, None, None),
+                (4.0, None, None),
+            ]
+        )
+        analysis = analyze_contacts(
+            series,
+            ContactRule("left", "right", enter_distance=2.0, exit_distance=3.0, min_contact_duration=1),
+        )
+
+        self.assertEqual([event.event_type for event in analysis.events], ["formed", "lost"])
+        self.assertEqual(len(analysis.intervals), 1)
+        interval = analysis.intervals[0].to_dict()
+        self.assertEqual(interval["start_index"], 0)
+        self.assertEqual(interval["end_index"], 3)
+        self.assertEqual(interval["observed_contact_duration"], 2)
+        self.assertEqual(interval["unresolved_gap_duration"], 1)
+        self.assertTrue(interval["has_unresolved_gap"])
+        self.assertFalse(interval["continuous_observed_contact"])
+        self.assertEqual(analysis.points[1].state, "unresolved")
+        self.assertEqual(analysis.points[1].explanation.startswith("Required atoms"), True)
+        self.assertEqual(analysis.points[0].atom_pairs["left"], [[4, 4]])
+
+    def test_brief_near_threshold_visit_does_not_emit_event(self):
+        series = self._contact_series(
+            [
+                (4.0, None, None),
+                (1.0, None, None),
+                (4.0, None, None),
+                (1.0, None, None),
+                (2.5, None, None),
+                (1.0, None, None),
+            ]
+        )
+        single_threshold = analyze_contacts(
+            series,
+            ContactRule("left", "right", enter_distance=2.0, exit_distance=2.0, min_contact_duration=2),
+        )
+        hysteresis = analyze_contacts(
+            series,
+            ContactRule("left", "right", enter_distance=2.0, exit_distance=3.0, min_contact_duration=2),
+        )
+
+        self.assertEqual(single_threshold.events, [])
+        self.assertEqual(hysteresis.points[4].state, "contact_held")
+        self.assertEqual([event.event_type for event in hysteresis.events], ["formed"])
+        self.assertEqual(hysteresis.intervals[0].observed_contact_indices, [3, 5])
+        self.assertEqual(hysteresis.intervals[0].hysteresis_hold_indices, [4])
+        self.assertEqual(hysteresis.intervals[0].to_dict()["sustained_duration"], 3)
+
+    def test_disputed_contact_evidence_keeps_all_interpretations(self):
+        series = self._contact_series(
+            [
+                (1.0, (1.0, 4.0), "cand-auto"),
+                (1.0, None, "decision-001"),
+                (4.0, None, "decision-001"),
+            ]
+        )
+        analysis = analyze_contacts(
+            series,
+            ContactRule("left", "right", enter_distance=2.0, exit_distance=3.0),
+        )
+
+        self.assertEqual(analysis.points[0].state, "unresolved")
+        self.assertEqual(analysis.points[0].evidence_state, "interpretation_disputed")
+        self.assertEqual(analysis.points[1].evidence_state, "confirmed_contact")
+        self.assertEqual(len(analysis.points[0].alternative_measurements), 2)
+        self.assertEqual(analysis.intervals[0].confirmed_contact_indices, [1])
+        self.assertEqual(analysis.intervals[0].observed_contact_indices, [1])
+
+    @staticmethod
+    def _contact_series(values):
+        points = []
+        for index, (distance, distance_range, candidate_id) in enumerate(values):
+            points.append(
+                RelativeMotionPoint(
+                    index=index,
+                    conformer_name=f"frame-{index}",
+                    source_path=f"frame-{index}.xyz",
+                    region_a="left",
+                    region_b="right",
+                    reference_region="core",
+                    distance=distance,
+                    previous_distance=None,
+                    distance_change=None,
+                    motion_state=None,
+                    angle_deg=None,
+                    angle_status="measured" if distance is not None else "missing_atoms",
+                    distance_range=list(distance_range) if distance_range is not None else None,
+                    angle_range=None,
+                    region_a_center=None,
+                    region_b_center=None,
+                    region_a_axis=None,
+                    region_b_axis=None,
+                    region_a_translation_distance=None,
+                    region_b_translation_distance=None,
+                    region_a_rotation_angle=None,
+                    region_b_rotation_angle=None,
+                    region_a_internal_rmsd=None,
+                    region_b_internal_rmsd=None,
+                    atom_pairs={"left": [[4, 4]], "right": [[6, 6]]},
+                    candidate_id=candidate_id,
+                    correspondence_status="confirmed" if candidate_id else "auto",
+                    available_interpretations=2 if distance_range is not None else 1,
+                    decision_id=candidate_id if str(candidate_id or "").startswith("decision-") else None,
+                    alternative_measurements=[
+                        {
+                            "candidate_id": candidate_id,
+                            "correspondence_status": "confirmed" if candidate_id else "auto",
+                            "distance": distance,
+                            "atom_pairs": {"left": [[4, 4]], "right": [[6, 6]]},
+                        },
+                        {
+                            "candidate_id": "cand-other",
+                            "correspondence_status": "alternative",
+                            "distance": None if distance_range is None else distance_range[1],
+                            "atom_pairs": {"left": [[4, 5]], "right": [[6, 6]]},
+                        },
+                    ],
+                )
+            )
+        return RelativeMotionSeries("left", "right", "core", points)
 
 
 if __name__ == "__main__":

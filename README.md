@@ -171,3 +171,43 @@ withdraw_project_correspondence(project, decision["decision_id"])
 ```
 
 重开项目并重新运行时，原始坐标不会被改写；不同参照区域的结果分目录保存，人工确认、撤回、候选方案和每一点的采用原子都可从 JSON 报告追溯。
+
+## 区域接触的形成、持续与失去
+
+在项目中设置 `contact_rules` 后，运行结果会为每个稳定参照目录生成 `contacts/区域A__区域B__进入距离__解除距离.json`。进入和解除阈值可以不同，形成迟滞区间；阈值附近的往返不会反复制造形成/失去事件。还可设置 `min_contact_duration`，短暂靠近若未达到要求就不会生成接触事件：
+
+```python
+project.contact_rules = [
+    {
+        "region_a": "loop",
+        "region_b": "helix",
+        "enter_distance": 4.0,
+        "exit_distance": 5.0,
+        "min_contact_duration": 2,
+    }
+]
+```
+
+每个接触点记录距离、采用的候选 ID、实际原子对、构象来源、人工决定 ID 和所有候选解释。缺少关键原子时状态为 `unresolved/missing_atoms`；不同对应关系分别支持接触与不接触时为 `unresolved/interpretation_disputed`。这两种帧都不会触发接触解除，也不会把前后直接观测接触算成一段无间断接触。
+
+持续区间分别统计：
+
+- `observed_contact_duration`：距离直接满足进入条件的构象数；
+- `hysteresis_hold_duration`：已形成后位于进入/解除阈值之间、由迟滞规则保持的构象数；
+- `confirmed_contact_duration`：带有人工决定 ID 的接触构象数；
+- `unresolved_gap_duration` 与 `evidence_segments`：缺失或解释分歧造成的隔断及每段的构象范围。
+
+人工确认一段候选前可先预览事件和持续时间变化，函数不修改当前项目：
+
+```python
+from molecular_toolkit import preview_project_correspondence_contact_impact
+
+preview = preview_project_correspondence_contact_impact(
+    project,
+    start_index=3,
+    end_index=7,
+    candidate_id="cand-001",
+)
+```
+
+预览中的 `before`/`after` 可直接比较接触事件、区间数量和各类持续时间。确认后再运行项目会生成正式报告；撤回沿用既有决定历史，只重新打开相关不确定构象，不覆盖原始坐标、候选或历史统计。

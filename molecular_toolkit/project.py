@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -9,6 +10,13 @@ from .candidates import CorrespondenceCandidate
 from .correspondence import AtomCorrespondence, Pair
 from .ensemble import Conformer, compare_ensemble, save_comparison_report
 from .relative_motion import analyze_relative_motion, correspondence_decision_impact, save_relative_motion_report
+from .contacts import (
+    ContactRule,
+    analyze_contacts,
+    contact_analyses_for_series,
+    contact_decision_preview,
+    save_contact_analysis,
+)
 from .structures import load_structure
 
 
@@ -89,6 +97,7 @@ class ComparisonProject:
     name: str | None = None
     notes: list[str] = field(default_factory=list)
     relative_motion_pairs: list[list[str]] = field(default_factory=list)
+    contact_rules: list[dict[str, Any]] = field(default_factory=list)
     correspondence_decisions: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -125,6 +134,7 @@ class ComparisonProject:
             "conformer_order": [spec.source_path for spec in self.conformers],
             "conformers": [_spec_to_dict(spec) for spec in self.conformers],
             "relative_motion_pairs": [list(pair) for pair in self.relative_motion_pairs],
+            "contact_rules": [ContactRule.from_value(rule).to_dict() for rule in self.contact_rules],
             "correspondence_decisions": self.correspondence_decisions,
             "notes": self.notes,
         }
@@ -150,6 +160,7 @@ def load_comparison_project(path: str | Path) -> ComparisonProject:
         name=data.get("name"),
         notes=list(data.get("notes", [])),
         relative_motion_pairs=[list(pair) for pair in data.get("relative_motion_pairs", [])],
+        contact_rules=list(data.get("contact_rules", [])),
         correspondence_decisions=list(data.get("correspondence_decisions", [])),
     )
 
@@ -263,6 +274,65 @@ def withdraw_project_correspondence(project: ComparisonProject, decision_id: str
     return withdrawal
 
 
+def preview_project_correspondence_contact_impact(
+    project: ComparisonProject,
+    start_index: int,
+    end_index: int,
+    *,
+    candidate_id: str | None = None,
+    note: str = "Preview of human-reviewed correspondence.",
+) -> dict[str, Any]:
+    """Return contact event/duration changes without mutating the project."""
+    before_runs = run_comparison_project(project)
+    preview_project = deepcopy(project)
+    confirm_project_correspondence(
+        preview_project,
+        start_index,
+        end_index,
+        candidate_id=candidate_id,
+        note=note,
+    )
+    after_runs = run_comparison_project(preview_project)
+    reference = load_structure(project.reference_path)
+    region_args = {
+        name: (value["reference_keys"], value.get("mobile_keys"))
+        for name, value in project.regions.items()
+    }
+    previews = []
+    for reference_name in before_runs:
+        for rule_value in project.contact_rules:
+            rule = ContactRule.from_value(rule_value)
+            pair = [rule.region_a, rule.region_b]
+            before_series = analyze_relative_motion(
+                before_runs[reference_name],
+                *pair,
+                reference_region=reference_name,
+                reference=reference,
+                stable_reference_keys=project.reference_regions[reference_name],
+                region_definitions=region_args,
+            )
+            after_series = analyze_relative_motion(
+                after_runs[reference_name],
+                *pair,
+                reference_region=reference_name,
+                reference=reference,
+                stable_reference_keys=preview_project.reference_regions[reference_name],
+                region_definitions=region_args,
+            )
+            preview = contact_decision_preview(
+                analyze_contacts(before_series, rule),
+                analyze_contacts(after_series, rule),
+            )
+            preview["reference_region"] = reference_name
+            previews.append(preview)
+    return {
+        "start_index": start_index,
+        "end_index": end_index,
+        "candidate_id": candidate_id,
+        "previews": previews,
+    }
+
+
 def _save_project_relative_motion_reports(project, runs, reference, region_args, report_directory):
     for region_names in project.relative_motion_pairs:
         if len(region_names) != 2:
@@ -290,6 +360,17 @@ def _save_project_relative_motion_reports(project, runs, reference, region_args,
                 series,
                 report_directory / reference_name / "relative_motion" / filename,
             )
+            for analysis in contact_analyses_for_series(series, project.contact_rules):
+                contact_filename = (
+                    f"{analysis.rule.region_a}__{analysis.rule.region_b}"
+                    f"__{analysis.rule.enter_distance:g}__{analysis.rule.exit_distance:g}"
+                    f"__min{analysis.rule.min_contact_duration}.json"
+                    .replace("/", "_")
+                )
+                save_contact_analysis(
+                    analysis,
+                    report_directory / reference_name / "contacts" / contact_filename,
+                )
 
 
 def save_reference_region_summary(runs: dict[str, list], path: str | Path) -> None:
