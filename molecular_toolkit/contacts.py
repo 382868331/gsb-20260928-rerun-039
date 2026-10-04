@@ -56,6 +56,7 @@ class ContactPoint:
     distance: float | None
     distance_range: tuple[float | None, float | None] | None
     atom_pairs: dict[str, list[list[int]]]
+    atom_coverage: dict[str, dict[str, int | None]] | None
     candidate_id: str | None
     correspondence_status: str
     decision_id: str | None
@@ -72,6 +73,7 @@ class ContactPoint:
             "distance": self.distance,
             "distance_range": list(self.distance_range) if self.distance_range is not None else None,
             "atom_pairs": self.atom_pairs,
+            "atom_coverage": self.atom_coverage,
             "candidate_id": self.candidate_id,
             "correspondence_status": self.correspondence_status,
             "decision_id": self.decision_id,
@@ -105,17 +107,26 @@ class ContactInterval:
     observed_contact_indices: list[int] = field(default_factory=list)
     confirmed_contact_indices: list[int] = field(default_factory=list)
     hysteresis_hold_indices: list[int] = field(default_factory=list)
+    unresolved_indices: list[int] = field(default_factory=list)
     evidence_segments: list[dict[str, Any]] = field(default_factory=list)
     events: list[ContactEvent] = field(default_factory=list)
     status: str = "active"
-    current_observed_run: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        gaps = [
-            segment
-            for segment in self.evidence_segments
-            if segment["evidence_state"] in ("missing_atoms", "interpretation_disputed")
-        ]
+        gap_states = (
+            "missing_all_atoms",
+            "missing_partial_atoms",
+            "missing_atoms",
+            "interpretation_disputed",
+        )
+        gaps = [segment for segment in self.evidence_segments if segment["evidence_state"] in gap_states]
+        notes: list[str] = []
+        if gaps:
+            kinds = sorted({segment["evidence_state"] for segment in gaps})
+            notes.append(
+                "Unresolved frames (" + ", ".join(kinds) + ") are retained as unknown evidence: they neither "
+                "count as zero-distance contact nor as confirmed separation, and they do not release the contact."
+            )
         return {
             "start_index": self.start_index,
             "end_index": self.end_index,
@@ -127,9 +138,11 @@ class ContactInterval:
             "observed_contact_indices": list(self.observed_contact_indices),
             "confirmed_contact_indices": list(self.confirmed_contact_indices),
             "hysteresis_hold_indices": list(self.hysteresis_hold_indices),
+            "unresolved_indices": list(self.unresolved_indices),
             "unresolved_gap_duration": sum(segment["end_index"] - segment["start_index"] + 1 for segment in gaps),
             "has_unresolved_gap": bool(gaps),
             "continuous_observed_contact": not gaps,
+            "notes": notes,
             "evidence_segments": self.evidence_segments,
             "events": [event.to_dict() for event in self.events],
         }
@@ -162,38 +175,42 @@ def analyze_contacts(series: RelativeMotionSeries, rule: ContactRule | dict[str,
     events: list[ContactEvent] = []
     active: ContactInterval | None = None
     announced = False
-    segment: dict[str, Any] | None = None
+    segments: list[dict[str, Any]] = []
+    current_segment: dict[str, Any] | None = None
 
-    def close_segment(end_index: int) -> None:
-        nonlocal segment
-        if segment is not None:
-            segment["end_index"] = end_index
-            if active is not None:
-                active.evidence_segments.append(segment)
-            segment = None
-
-    def append_segment(start_index: int, state: str) -> None:
-        nonlocal segment
-        close_segment(start_index - 1)
-        segment = {
-            "start_index": start_index,
-            "end_index": start_index,
+    def append_segment(index: int, state: str) -> None:
+        nonlocal current_segment
+        if current_segment is not None and current_segment["evidence_state"] == state:
+            current_segment["end_index"] = index
+            return
+        if current_segment is not None:
+            segments.append(current_segment)
+        current_segment = {
+            "start_index": index,
+            "end_index": index,
             "evidence_state": state,
         }
+
+    contact_evidence = ("observed_contact", "confirmed_contact")
+    unresolved_evidence = (
+        "missing_all_atoms",
+        "missing_partial_atoms",
+        "missing_atoms",
+        "interpretation_disputed",
+    )
 
     for contact_point in raw_points:
         index = contact_point.index
         evidence = contact_point.evidence_state
-        if evidence in ("observed_contact", "confirmed_contact"):
+        if evidence in contact_evidence:
+            append_segment(index, evidence)
             if active is None:
                 active = ContactInterval(start_index=index)
                 announced = False
-            append_segment(index, evidence)
             active.observed_contact_indices.append(index)
-            active.current_observed_run += 1
             if evidence == "confirmed_contact":
                 active.confirmed_contact_indices.append(index)
-            if not announced and active.current_observed_run >= rule.min_contact_duration:
+            if not announced and _trailing_observed_run(raw_points, index) >= rule.min_contact_duration:
                 event = ContactEvent(
                     "formed",
                     index,
@@ -203,47 +220,88 @@ def analyze_contacts(series: RelativeMotionSeries, rule: ContactRule | dict[str,
                 active.events.append(event)
                 events.append(event)
                 announced = True
-        elif evidence in ("missing_atoms", "interpretation_disputed"):
+            active.status = "active"
+        elif evidence in unresolved_evidence:
+            append_segment(index, evidence)
             if active is not None:
-                append_segment(index, evidence)
+                active.unresolved_indices.append(index)
                 if not announced:
-                    close_segment(index - 1)
                     active = None
-                else:
-                    active.current_observed_run = 0
+                    # Unknown frames hold the outcome open; an already
+                    # announced contact is neither lost nor bridged.
+                if active is not None:
                     active.status = "unresolved"
             contact_point.state = "unresolved"
         elif evidence == "hysteresis_hold":
+            append_segment(index, "hysteresis_hold")
             if active is not None:
-                append_segment(index, "hysteresis_hold")
                 active.hysteresis_hold_indices.append(index)
-                active.status = "active"
+                if announced:
+                    active.status = "active"
             else:
                 contact_point.state = "no_contact"
-        elif evidence == "no_contact" and active is not None:
-            close_segment(index - 1)
-            if len(active.observed_contact_indices) >= rule.min_contact_duration:
-                active.end_index = index
-                active.status = "lost"
-                event = ContactEvent(
-                    "lost",
-                    index,
-                    active.start_index,
-                    "Contact reached the release distance; unresolved frames did not close it.",
-                )
-                active.events.append(event)
-                events.append(event)
-                intervals.append(active)
-            active = None
-            announced = False
-            segment = None
+        elif evidence == "no_contact":
+            append_segment(index, "no_contact")
+            if active is not None:
+                if announced:
+                    active.end_index = index
+                    active.status = "lost"
+                    message = "Adopted correspondence placed the regions at or beyond the release distance."
+                    event = ContactEvent("lost", index, active.start_index, message)
+                    active.events.append(event)
+                    events.append(event)
+                    intervals.append(active)
+                active = None
+                announced = False
 
-    close_segment(len(raw_points) - 1)
+    if current_segment is not None:
+        segments.append(current_segment)
     if active is not None:
-        if len(active.observed_contact_indices) >= rule.min_contact_duration:
-            active.status = "active"
+        if announced:
+            active.status = "unresolved" if _ends_unresolved(raw_points) and active.unresolved_indices else "active"
             intervals.append(active)
+    _attach_segments(intervals, segments, len(raw_points) - 1)
     return ContactAnalysis(rule=rule, points=raw_points, intervals=intervals, events=events)
+
+
+def _trailing_observed_run(points, index):
+    """Count consecutive directly observed/held frames ending at index.
+
+    Contact frames and hysteresis-hold frames both contribute to the
+    minimum formation duration; unresolved frames interrupt the run.
+    """
+    run = 0
+    cursor = index
+    while cursor >= 0:
+        if points[cursor].evidence_state in (
+            "observed_contact",
+            "confirmed_contact",
+            "hysteresis_hold",
+        ):
+            run += 1
+        else:
+            break
+        cursor -= 1
+    return run
+
+
+def _ends_unresolved(points):
+    return points[-1].evidence_state in (
+        "missing_all_atoms",
+        "missing_partial_atoms",
+        "missing_atoms",
+        "interpretation_disputed",
+    )
+
+
+def _attach_segments(intervals, segments, last_index):
+    for interval in intervals:
+        end = interval.end_index if interval.end_index is not None else last_index
+        interval.evidence_segments = [
+            segment
+            for segment in segments
+            if interval.start_index <= segment["start_index"] and segment["end_index"] <= end
+        ]
 
 
 def contact_analyses_for_series(
@@ -294,7 +352,27 @@ def _classify_point(point, rule: ContactRule) -> ContactPoint:
     distance = point.distance
     low, high = (None, None) if point.distance_range is None else point.distance_range
     manually_confirmed = point.decision_id is not None
-    if distance is None:
+    expected_a = getattr(point, "region_a_expected_atoms", None)
+    observed_a = getattr(point, "region_a_observed_atoms", None)
+    expected_b = getattr(point, "region_b_expected_atoms", None)
+    observed_b = getattr(point, "region_b_observed_atoms", None)
+    coverage = _coverage_dict(point, expected_a, observed_a, expected_b, observed_b)
+    missing = _missing_regions(expected_a, observed_a, expected_b, observed_b)
+    if missing == "all":
+        evidence = "missing_all_atoms"
+        state = "unresolved"
+        explanation = (
+            "All atoms of at least one contact region are absent at this frame; "
+            "contact status is unknown and must not be read as zero-distance contact or as separation."
+        )
+    elif missing == "partial":
+        evidence = "missing_partial_atoms"
+        state = "unresolved"
+        explanation = (
+            "Only part of a contact region is observed at this frame; the measured distance is not a complete "
+            "basis, so contact status stays unknown instead of being forced to contact or separation."
+        )
+    elif distance is None:
         evidence = "missing_atoms"
         state = "unresolved"
         explanation = "Required atoms are absent; contact can neither be formed nor released at this frame."
@@ -302,10 +380,20 @@ def _classify_point(point, rule: ContactRule) -> ContactPoint:
         evidence = "interpretation_disputed"
         state = "unresolved"
         explanation = "Alternative atom correspondences support both contact and no-contact interpretations."
-    elif low is not None and high is not None and high < rule.exit_distance:
-        evidence = "confirmed_contact" if manually_confirmed else "observed_contact"
-        state = "contact"
-        explanation = "Every available correspondence places the regions within the release distance."
+    elif low is not None and high is not None and low < rule.enter_distance <= high:
+        evidence = "interpretation_disputed"
+        state = "unresolved"
+        explanation = (
+            "Alternative atom correspondences place the regions on different sides of the formation "
+            "threshold; contact status is unknown."
+        )
+    elif low is not None and high is not None and low < rule.exit_distance <= high:
+        evidence = "interpretation_disputed"
+        state = "unresolved"
+        explanation = (
+            "Alternative atom correspondences place the regions on different sides of the release "
+            "threshold; separation cannot be asserted."
+        )
     elif distance <= rule.enter_distance:
         evidence = "confirmed_contact" if manually_confirmed else "observed_contact"
         state = "contact"
@@ -325,6 +413,7 @@ def _classify_point(point, rule: ContactRule) -> ContactPoint:
         distance=distance,
         distance_range=point.distance_range,
         atom_pairs=point.atom_pairs,
+        atom_coverage=coverage,
         candidate_id=point.candidate_id,
         correspondence_status=point.correspondence_status,
         decision_id=point.decision_id,
@@ -333,3 +422,40 @@ def _classify_point(point, rule: ContactRule) -> ContactPoint:
         explanation=explanation,
         alternative_measurements=getattr(point, "alternative_measurements", []),
     )
+
+
+def _missing_regions(expected_a, observed_a, expected_b, observed_b) -> str | None:
+    """Return 'all' when a region vanished, 'partial' for incomplete coverage."""
+    states = [_coverage_state(expected_a, observed_a), _coverage_state(expected_b, observed_b)]
+    if "all" in states:
+        return "all"
+    if "partial" in states:
+        return "partial"
+    return None
+
+
+def _coverage_state(expected, observed) -> str | None:
+    if expected is None:
+        return None
+    if observed is None or observed <= 0:
+        return "all"
+    if observed < expected:
+        return "partial"
+    return None
+
+
+def _coverage_dict(point, expected_a, observed_a, expected_b, observed_b):
+    if expected_a is None and expected_b is None:
+        return getattr(point, "atom_coverage", None)
+
+    def entry(expected, observed):
+        return {
+            "expected_atoms": expected,
+            "observed_atoms": observed,
+            "missing_atoms": None if expected is None else expected - (observed or 0),
+        }
+
+    return {
+        point.region_a: entry(expected_a, observed_a),
+        point.region_b: entry(expected_b, observed_b),
+    }

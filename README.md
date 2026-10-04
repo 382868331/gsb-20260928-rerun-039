@@ -188,7 +188,14 @@ project.contact_rules = [
 ]
 ```
 
-每个接触点记录距离、采用的候选 ID、实际原子对、构象来源、人工决定 ID 和所有候选解释。缺少关键原子时状态为 `unresolved/missing_atoms`；不同对应关系分别支持接触与不接触时为 `unresolved/interpretation_disputed`。这两种帧都不会触发接触解除，也不会把前后直接观测接触算成一段无间断接触。
+每个接触点记录距离、采用的候选 ID、实际原子对、构象来源、人工决定 ID、所有候选解释以及 `atom_coverage`（每侧区域的 `expected_atoms`、`observed_atoms`、`missing_atoms`）。缺测帧显式保留为未知，距离为 `null`（全缺测）或仅基于残余原子的临时数值（部分缺测），绝不当成零距离接触或确定分离：
+
+- `unresolved/missing_all_atoms`：至少一个接触区域的全部原子在该帧缺失（早期实现会在空数组拼接处抛出 `ValueError`，现在继续后续分析）；
+- `unresolved/missing_partial_atoms`：区域只观测到部分原子，中心距不足以代表整体；
+- `unresolved/missing_atoms`：没有区域原子数基线时的缺测兜底状态；
+- `unresolved/interpretation_disputed`：不同候选对应分别支持接触与不接触。
+
+这些未知帧都不会触发接触形成或解除：已宣布的接触在未知帧期间挂起为 `unresolved`，再次直接观测到接触时回到 `active`，只有距离达到解除阈值才生成 `lost`；未知帧也不会把前后直接观测接触算成一段无间断接触。刚体整体旋转/平移只改变坐标参考，不改变阈值判定。
 
 持续区间分别统计：
 
@@ -196,6 +203,8 @@ project.contact_rules = [
 - `hysteresis_hold_duration`：已形成后位于进入/解除阈值之间、由迟滞规则保持的构象数；
 - `confirmed_contact_duration`：带有人工决定 ID 的接触构象数；
 - `unresolved_gap_duration` 与 `evidence_segments`：缺失或解释分歧造成的隔断及每段的构象范围。
+
+区间还输出 `unresolved_indices` 和 `notes`，明确说明缺测对持续性的影响；即使区域原子全部缺失，该帧仍保留另一区域的原子对、构象来源和候选解释，保存重开或切换到其他对应候选后都能从 JSON 报告逐帧复核。
 
 人工确认一段候选前可先预览事件和持续时间变化，函数不修改当前项目：
 

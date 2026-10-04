@@ -43,6 +43,10 @@ class RelativeMotionPoint:
     available_interpretations: int
     decision_id: str | None = None
     alternative_measurements: list[dict[str, Any]] = field(default_factory=list)
+    region_a_expected_atoms: int | None = None
+    region_a_observed_atoms: int | None = None
+    region_b_expected_atoms: int | None = None
+    region_b_observed_atoms: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,6 +74,22 @@ class RelativeMotionPoint:
             "region_a_internal_rmsd": self.region_a_internal_rmsd,
             "region_b_internal_rmsd": self.region_b_internal_rmsd,
             "atom_pairs": self.atom_pairs,
+            "atom_coverage": {
+                self.region_a: {
+                    "expected_atoms": self.region_a_expected_atoms,
+                    "observed_atoms": self.region_a_observed_atoms,
+                    "missing_atoms": None
+                    if self.region_a_expected_atoms is None
+                    else self.region_a_expected_atoms - (self.region_a_observed_atoms or 0),
+                },
+                self.region_b: {
+                    "expected_atoms": self.region_b_expected_atoms,
+                    "observed_atoms": self.region_b_observed_atoms,
+                    "missing_atoms": None
+                    if self.region_b_expected_atoms is None
+                    else self.region_b_expected_atoms - (self.region_b_observed_atoms or 0),
+                },
+            },
             "candidate_id": self.candidate_id,
             "correspondence_status": self.correspondence_status,
             "available_interpretations": self.available_interpretations,
@@ -149,6 +169,13 @@ def analyze_relative_motion(
         distance = selected["distance"]
         change = None if distance is None or previous_distance is None else distance - previous_distance
         source = comparison.conformer.source_path
+        def expected_count(name: str) -> int | None:
+            if region_definitions is None or name not in region_definitions:
+                return None
+            return len(region_definitions[name][0])
+
+        expected_a = expected_count(region_a)
+        expected_b = expected_count(region_b)
         points.append(
             RelativeMotionPoint(
                 index=index,
@@ -181,6 +208,10 @@ def analyze_relative_motion(
                 available_interpretations=len(measurements),
                 decision_id=decisions.get(source or ""),
                 alternative_measurements=[_measurement_summary(item) for item in measurements],
+                region_a_expected_atoms=expected_a,
+                region_a_observed_atoms=len(selected["pairs"][region_a]),
+                region_b_expected_atoms=expected_b,
+                region_b_observed_atoms=len(selected["pairs"][region_b]),
             )
         )
         if distance is not None:

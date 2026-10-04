@@ -288,6 +288,16 @@ def _measure_region(name, reference, aligned_mobile, pairs):
         distances=distances,
         vectors=vectors,
     )
+    if not pairs:
+        # Every expected atom of this region is absent in the conformer.
+        # Keep the region as an empty measurement instead of failing on an
+        # empty concatenation; downstream analyses must treat it as unknown.
+        result.local_translation = None
+        result.internal_vectors = []
+        result.internal_distances = []
+        result.internal_rmsd_value = None
+        result.rigid_fit_status = "missing_atoms"
+        return result
     reference_points = np.vstack([reference.atom(key).xyz for key in result.reference_keys])
     aligned_points = np.vstack([aligned_mobile.atom(key).xyz for key in result.mobile_keys])
     _add_local_motion(result, reference_points, aligned_points)
