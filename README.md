@@ -199,6 +199,8 @@ project.contact_rules = [
 - `confirmed_contact_duration`：带有人工决定 ID 的接触构象数；
 - `unresolved_gap_duration` 与 `evidence_segments`：缺失或解释分歧造成的隔断及每段的构象范围。
 
+区间以缺测或解释分歧帧结尾时，状态不会再误报为 `active`，而是 `unresolved`：`last_contact_index` 保留最后一次直接确认接触的构象位置，`trailing_unresolved_range`/`trailing_unresolved_duration` 给出末尾缺测范围，`end_index` 保持 `null`，同时生成一个 `unresolved` 事件。末尾未知帧既不计入接触持续，也不判定为确定分离；若后续帧恢复到迟滞保持区间，区间重新标记为 `active`，若恢复后距离达到解除阈值，则正常以 `lost` 结束。
+
 人工确认一段候选前可先预览事件和持续时间变化，函数不修改当前项目：
 
 ```python

@@ -111,6 +111,8 @@ class ContactInterval:
     events: list[ContactEvent] = field(default_factory=list)
     status: str = "active"
     current_observed_run: int = 0
+    last_contact_index: int | None = None
+    trailing_unresolved_range: tuple[int, int] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         gaps = [
@@ -118,10 +120,23 @@ class ContactInterval:
             for segment in self.evidence_segments
             if segment["evidence_state"] in ("missing_atoms", "interpretation_disputed")
         ]
+        trailing_segment = self.evidence_segments[-1] if self.evidence_segments else None
         return {
             "start_index": self.start_index,
             "end_index": self.end_index,
             "status": self.status,
+            "last_contact_index": self.last_contact_index,
+            "end_evidence_state": trailing_segment["evidence_state"] if trailing_segment is not None else None,
+            "trailing_unresolved_range": (
+                list(self.trailing_unresolved_range)
+                if self.trailing_unresolved_range is not None
+                else None
+            ),
+            "trailing_unresolved_duration": (
+                self.trailing_unresolved_range[1] - self.trailing_unresolved_range[0] + 1
+                if self.trailing_unresolved_range is not None
+                else 0
+            ),
             "observed_contact_duration": len(self.observed_contact_indices),
             "confirmed_contact_duration": len(self.confirmed_contact_indices),
             "hysteresis_hold_duration": len(self.hysteresis_hold_indices),
@@ -199,6 +214,7 @@ def analyze_contacts(series: RelativeMotionSeries, rule: ContactRule | dict[str,
                 announced = False
             append_segment(index, evidence)
             active.observed_contact_indices.append(index)
+            active.last_contact_index = index
             active.current_observed_run += 1
             if evidence == "confirmed_contact":
                 active.confirmed_contact_indices.append(index)
@@ -220,13 +236,11 @@ def analyze_contacts(series: RelativeMotionSeries, rule: ContactRule | dict[str,
                     active = None
                 else:
                     active.current_observed_run = 0
-                    active.status = "unresolved"
             contact_point.state = "unresolved"
         elif evidence == "hysteresis_hold":
             if active is not None:
                 append_segment(index, "hysteresis_hold")
                 active.hysteresis_hold_indices.append(index)
-                active.status = "active"
             else:
                 contact_point.state = "no_contact"
         elif evidence == "no_contact" and active is not None:
@@ -250,7 +264,30 @@ def analyze_contacts(series: RelativeMotionSeries, rule: ContactRule | dict[str,
     close_segment(len(raw_points) - 1)
     if active is not None:
         if len(active.observed_contact_indices) >= rule.min_contact_duration:
-            active.status = "active"
+            trailing_segment = active.evidence_segments[-1] if active.evidence_segments else None
+            ends_unresolved = (
+                trailing_segment is not None
+                and trailing_segment["evidence_state"] in ("missing_atoms", "interpretation_disputed")
+            )
+            if ends_unresolved:
+                active.status = "unresolved"
+                active.trailing_unresolved_range = (
+                    trailing_segment["start_index"],
+                    trailing_segment["end_index"],
+                )
+                event = ContactEvent(
+                    "unresolved",
+                    trailing_segment["end_index"],
+                    active.start_index,
+                    "The interval ends without sufficient evidence: the last confirmed contact is "
+                    f"at frame {active.last_contact_index}; frames "
+                    f"{trailing_segment['start_index']}-{trailing_segment['end_index']} are neither "
+                    "contact nor confirmed separation.",
+                )
+                active.events.append(event)
+                events.append(event)
+            else:
+                active.status = "active"
             intervals.append(active)
     return ContactAnalysis(rule=rule, points=raw_points, intervals=intervals, events=events)
 
@@ -281,8 +318,22 @@ def contact_decision_preview(before: ContactAnalysis, after: ContactAnalysis) ->
         "durations_changed": [
             index
             for index, (old, new) in enumerate(zip(before_intervals, after_intervals))
-            if (old["observed_contact_duration"], old["confirmed_contact_duration"], old["unresolved_gap_duration"])
-            != (new["observed_contact_duration"], new["confirmed_contact_duration"], new["unresolved_gap_duration"])
+            if (
+                old["observed_contact_duration"],
+                old["confirmed_contact_duration"],
+                old["unresolved_gap_duration"],
+                old["status"],
+                old["last_contact_index"],
+                old["trailing_unresolved_range"],
+            )
+            != (
+                new["observed_contact_duration"],
+                new["confirmed_contact_duration"],
+                new["unresolved_gap_duration"],
+                new["status"],
+                new["last_contact_index"],
+                new["trailing_unresolved_range"],
+            )
         ],
         "interval_count_changed": len(before_intervals) != len(after_intervals),
     }

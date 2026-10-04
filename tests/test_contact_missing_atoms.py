@@ -208,7 +208,226 @@ class MissingAtomContactTests(unittest.TestCase):
                 self.assertAlmostEqual(actual.distance, expected.distance, places=7)
 
 
+def run_custom_contact_analysis(distances, right_keys, transform=None):
+    reference = make_reference()
+    conformers = []
+    correspondences = []
+    for index, (distance, keys_present) in enumerate(zip(distances, right_keys)):
+        mobile, keys = make_mobile(distance if distance is not None else 0.2, keys_present)
+        if transform is not None:
+            rotation, translation = transform
+            mobile = transform_structure(mobile, rotation, translation)
+        conformers.append(Conformer(name=f"frame-{index}", structure=mobile))
+        correspondences.append(make_correspondence(keys))
+    comparisons = compare_ensemble(
+        reference,
+        list(zip(conformers, correspondences)),
+        [0, 1, 2, 3],
+        {"left": (LEFT_KEYS, None), "right": (RIGHT_KEYS, None)},
+    )
+    series = analyze_relative_motion(comparisons, "left", "right")
+    rule = ContactRule(
+        region_a="left",
+        region_b="right",
+        enter_distance=ENTER_DISTANCE,
+        exit_distance=EXIT_DISTANCE,
+        min_contact_duration=1,
+    )
+    return analyze_contacts(series, rule), series
+
+
+class TailUnresolvedContactTests(unittest.TestCase):
+    def _assert_tail_unresolved(self, interval_dict, expected_last_contact, expected_range):
+        self.assertEqual(interval_dict["status"], "unresolved")
+        self.assertEqual(interval_dict["last_contact_index"], expected_last_contact)
+        self.assertEqual(interval_dict["end_evidence_state"], "missing_atoms")
+        self.assertEqual(interval_dict["trailing_unresolved_range"], expected_range)
+        start, end = expected_range
+        self.assertEqual(interval_dict["trailing_unresolved_duration"], end - start + 1)
+        self.assertEqual(interval_dict["end_index"], None)
+
+    def test_contact_then_fully_missing_tail_is_not_active(self):
+        distances = [0.2, None, None]
+        right_keys = [RIGHT_KEYS, [], []]
+        analysis, _ = run_custom_contact_analysis(distances, right_keys)
+
+        self.assertEqual(
+            [point.state for point in analysis.points],
+            ["contact", "unresolved", "unresolved"],
+        )
+        self.assertEqual(len(analysis.intervals), 1)
+        interval = analysis.intervals[0].to_dict()
+        self._assert_tail_unresolved(interval, 0, [1, 2])
+        self.assertEqual(interval["observed_contact_indices"], [0])
+        self.assertFalse(any(index in interval["observed_contact_indices"] for index in (1, 2)))
+        tail_events = [event for event in analysis.events if event.event_type == "unresolved"]
+        self.assertEqual([(event.index, event.contact_start_index) for event in tail_events], [(2, 0)])
+        self.assertNotIn(
+            "lost",
+            [event.event_type for event in analysis.events],
+        )
+
+    def test_contact_then_partially_missing_tail_is_not_active(self):
+        distances = [0.2, None]
+        right_keys = [RIGHT_KEYS, [7, 8]]
+        analysis, series = run_custom_contact_analysis(distances, right_keys)
+
+        self.assertIsNone(series.points[1].distance)
+        self.assertEqual(series.points[1].missing_atoms, {"right": [9]})
+        self.assertEqual(
+            [point.state for point in analysis.points],
+            ["contact", "unresolved"],
+        )
+        interval = analysis.intervals[0].to_dict()
+        self._assert_tail_unresolved(interval, 0, [1, 1])
+        self.assertEqual(interval["trailing_unresolved_duration"], 1)
+
+    def test_missing_tail_recovers_to_hysteresis_hold_stays_active(self):
+        distances = [0.2, None, 0.45]
+        right_keys = [RIGHT_KEYS, [], RIGHT_KEYS]
+        analysis, _ = run_custom_contact_analysis(distances, right_keys)
+
+        self.assertEqual(
+            [point.state for point in analysis.points],
+            ["contact", "unresolved", "contact_held"],
+        )
+        self.assertEqual(len(analysis.intervals), 1)
+        interval = analysis.intervals[0].to_dict()
+        self.assertEqual(interval["status"], "active")
+        self.assertEqual(interval["last_contact_index"], 0)
+        self.assertIsNone(interval["trailing_unresolved_range"])
+        self.assertEqual(interval["trailing_unresolved_duration"], 0)
+        self.assertEqual(interval["end_evidence_state"], "hysteresis_hold")
+        self.assertEqual(interval["unresolved_gap_duration"], 1)
+        self.assertTrue(interval["has_unresolved_gap"])
+        self.assertEqual(
+            [event.event_type for event in analysis.events],
+            ["formed"],
+        )
+
+    def test_missing_tail_recovers_beyond_exit_threshold_is_lost(self):
+        distances = [0.2, None, 0.9]
+        right_keys = [RIGHT_KEYS, [], RIGHT_KEYS]
+        analysis, _ = run_custom_contact_analysis(distances, right_keys)
+
+        self.assertEqual(
+            [point.state for point in analysis.points],
+            ["contact", "unresolved", "no_contact"],
+        )
+        self.assertEqual(len(analysis.intervals), 1)
+        interval = analysis.intervals[0].to_dict()
+        self.assertEqual(interval["status"], "lost")
+        self.assertEqual(interval["end_index"], 2)
+        self.assertEqual(interval["last_contact_index"], 0)
+        self.assertIsNone(interval["trailing_unresolved_range"])
+        self.assertEqual(
+            [(event.event_type, event.index) for event in analysis.events],
+            [("formed", 0), ("lost", 2)],
+        )
+
+    def test_rigid_transform_does_not_change_tail_conclusions(self):
+        scenarios = [
+            ([0.2, None, None], [RIGHT_KEYS, [], []]),
+            ([0.2, None], [RIGHT_KEYS, [7, 8]]),
+            ([0.2, None, 0.45], [RIGHT_KEYS, [], RIGHT_KEYS]),
+            ([0.2, None, 0.9], [RIGHT_KEYS, [], RIGHT_KEYS]),
+        ]
+        for distances, right_keys in scenarios:
+            with self.subTest(distances=distances):
+                baseline, _ = run_custom_contact_analysis(distances, right_keys)
+                moved, _ = run_custom_contact_analysis(
+                    distances, right_keys, transform=rigid_transform()
+                )
+                self.assertEqual(
+                    [point.state for point in moved.points],
+                    [point.state for point in baseline.points],
+                )
+                self.assertEqual(
+                    [interval.to_dict() for interval in moved.intervals],
+                    [interval.to_dict() for interval in baseline.intervals],
+                )
+                self.assertEqual(
+                    [event.to_dict() for event in moved.events],
+                    [event.to_dict() for event in baseline.events],
+                )
+
+
 class MissingAtomProjectTests(unittest.TestCase):
+    def _build_tail_project(self, directory):
+        directory = Path(directory)
+        reference = make_reference()
+        reference_path = directory / "reference.json"
+        save_structure(reference, reference_path)
+        tail_distances = [0.2, None, None]
+        tail_right_keys = [RIGHT_KEYS, [], []]
+        specs = []
+        for index, (distance, keys_present) in enumerate(zip(tail_distances, tail_right_keys)):
+            mobile, _ = make_mobile(distance if distance is not None else 0.2, keys_present)
+            path = directory / f"tail-frame-{index}.json"
+            save_structure(mobile, path)
+            candidates = candidates_from_identity(reference, mobile)
+            specs.append(
+                ConformerCorrespondenceSpec.from_correspondence(
+                    path,
+                    candidates[0].to_correspondence(),
+                    name=f"tail-frame-{index}",
+                    candidate_id=candidates[0].candidate_id,
+                    alternatives=candidates,
+                )
+            )
+        return ComparisonProject(
+            reference_path=str(reference_path),
+            conformers=specs,
+            reference_regions={"core": [0, 1, 2, 3]},
+            regions={"left": (LEFT_KEYS, None), "right": (RIGHT_KEYS, None)},
+            relative_motion_pairs=[["left", "right"]],
+            contact_rules=[
+                {
+                    "region_a": "left",
+                    "region_b": "right",
+                    "enter_distance": ENTER_DISTANCE,
+                    "exit_distance": EXIT_DISTANCE,
+                    "min_contact_duration": 1,
+                }
+            ],
+        )
+
+    def test_tail_unresolved_interval_survives_export_and_reopen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = self._build_tail_project(directory)
+            run_comparison_project(project, report_directory=Path(directory) / "reports-initial")
+            initial = self._contacts_report(Path(directory) / "reports-initial")
+
+            self.assertEqual(
+                [point["state"] for point in initial["points"]],
+                ["contact", "unresolved", "unresolved"],
+            )
+            interval = initial["intervals"][0]
+            self.assertEqual(interval["status"], "unresolved")
+            self.assertEqual(interval["last_contact_index"], 0)
+            self.assertEqual(interval["trailing_unresolved_range"], [1, 2])
+            self.assertEqual(interval["trailing_unresolved_duration"], 2)
+            self.assertIsNone(interval["end_index"])
+            self.assertEqual(interval["observed_contact_indices"], [0])
+            self.assertIn(
+                {"event_type": "unresolved", "index": 2, "contact_start_index": 0},
+                [
+                    {
+                        "event_type": event["event_type"],
+                        "index": event["index"],
+                        "contact_start_index": event["contact_start_index"],
+                    }
+                    for event in initial["events"]
+                ],
+            )
+
+            project_path = Path(directory) / "project.json"
+            save_comparison_project(project, project_path)
+            reopened = load_comparison_project(project_path)
+            run_comparison_project(reopened, report_directory=Path(directory) / "reports-reopened")
+            reopened_report = self._contacts_report(Path(directory) / "reports-reopened")
+            self.assertEqual(reopened_report, initial)
+
     def _build_project(self, directory):
         directory = Path(directory)
         reference = make_reference()
