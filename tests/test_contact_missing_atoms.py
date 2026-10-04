@@ -26,6 +26,8 @@ from molecular_toolkit import (
     withdraw_project_correspondence,
 )
 
+from molecular_toolkit import RelativeMotionPoint, RelativeMotionSeries, save_contact_analysis
+
 ENTER_DISTANCE = 0.3
 EXIT_DISTANCE = 0.6
 CORE = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
@@ -324,6 +326,188 @@ class MissingAtomProjectTests(unittest.TestCase):
                 [point["distance"] for point in initial["points"]],
             )
             self.assertEqual(withdrawn["intervals"], initial["intervals"])
+
+
+def make_motion_point(index, distance, missing_atoms=None, atom_pairs=None):
+    return RelativeMotionPoint(
+        index=index,
+        conformer_name=f"frame-{index}",
+        source_path=None,
+        region_a="left",
+        region_b="right",
+        reference_region=None,
+        distance=distance,
+        previous_distance=None,
+        distance_change=None,
+        motion_state=None,
+        angle_deg=None,
+        angle_status="ok",
+        distance_range=None,
+        angle_range=None,
+        region_a_center=None,
+        region_b_center=None,
+        region_a_axis=None,
+        region_b_axis=None,
+        region_a_translation_distance=None,
+        region_b_translation_distance=None,
+        region_a_rotation_angle=None,
+        region_b_rotation_angle=None,
+        region_a_internal_rmsd=None,
+        region_b_internal_rmsd=None,
+        atom_pairs=atom_pairs if atom_pairs is not None else {"left": [[4, 4]], "right": [[7, 7]]},
+        candidate_id=None,
+        correspondence_status="ok",
+        available_interpretations=1,
+        missing_atoms=missing_atoms or {},
+    )
+
+
+def make_series(frame_distances, missing_atoms_by_index=None, atom_pairs_by_index=None):
+    missing_atoms_by_index = missing_atoms_by_index or {}
+    atom_pairs_by_index = atom_pairs_by_index or {}
+    points = [
+        make_motion_point(
+            index,
+            distance,
+            missing_atoms=missing_atoms_by_index.get(index),
+            atom_pairs=atom_pairs_by_index.get(index),
+        )
+        for index, distance in enumerate(frame_distances)
+    ]
+    return RelativeMotionSeries(
+        region_a="left", region_b="right", reference_region=None, points=points
+    )
+
+
+TRAILING_RULE = ContactRule(
+    region_a="left",
+    region_b="right",
+    enter_distance=ENTER_DISTANCE,
+    exit_distance=EXIT_DISTANCE,
+    min_contact_duration=1,
+)
+
+
+class TrailingMissingEvidenceTests(unittest.TestCase):
+    def test_contact_then_fully_missing_tail_is_not_reported_active(self):
+        series = make_series(
+            [0.2, 0.25, None, None],
+            missing_atoms_by_index={2: {"right": [7, 8, 9]}, 3: {"right": [7, 8, 9]}},
+            atom_pairs_by_index={
+                2: {"left": [[4, 4]], "right": []},
+                3: {"left": [[4, 4]], "right": []},
+            },
+        )
+        analysis = analyze_contacts(series, TRAILING_RULE)
+
+        self.assertEqual(
+            [point.state for point in analysis.points],
+            ["contact", "contact", "unresolved", "unresolved"],
+        )
+        self.assertEqual(len(analysis.intervals), 1)
+        interval = analysis.intervals[0].to_dict()
+        self.assertEqual(interval["status"], "unresolved")
+        self.assertTrue(interval["ends_with_unresolved_evidence"])
+        self.assertEqual(
+            interval["trailing_unresolved_segment"],
+            {"start_index": 2, "end_index": 3, "evidence_state": "missing_atoms"},
+        )
+        self.assertEqual(interval["last_observed_contact_index"], 1)
+        self.assertIsNone(interval["last_confirmed_contact_index"])
+        self.assertEqual(interval["sustained_duration"], 2)
+        self.assertEqual(interval["unresolved_gap_duration"], 2)
+        self.assertIsNone(interval["end_index"])
+        self.assertEqual(
+            [(event.event_type, event.index) for event in analysis.events],
+            [("formed", 0)],
+        )
+
+    def test_contact_then_partially_missing_tail_keeps_retained_pairs(self):
+        series = make_series(
+            [0.2, None],
+            missing_atoms_by_index={1: {"right": [9]}},
+            atom_pairs_by_index={1: {"left": [[4, 4]], "right": [[7, 7], [8, 8]]}},
+        )
+        analysis = analyze_contacts(series, TRAILING_RULE)
+
+        self.assertEqual(analysis.points[1].state, "unresolved")
+        self.assertIn("partially measured", analysis.points[1].explanation)
+        interval = analysis.intervals[0].to_dict()
+        self.assertEqual(interval["status"], "unresolved")
+        self.assertTrue(interval["ends_with_unresolved_evidence"])
+        self.assertEqual(
+            interval["trailing_unresolved_segment"],
+            {"start_index": 1, "end_index": 1, "evidence_state": "missing_atoms"},
+        )
+        self.assertEqual(interval["last_observed_contact_index"], 0)
+        self.assertEqual(interval["sustained_duration"], 1)
+
+    def test_missing_tail_recovered_by_hysteresis_hold_stays_active(self):
+        series = make_series(
+            [0.2, None, 0.45],
+            missing_atoms_by_index={1: {"right": [7, 8, 9]}},
+            atom_pairs_by_index={1: {"left": [[4, 4]], "right": []}},
+        )
+        analysis = analyze_contacts(series, TRAILING_RULE)
+
+        self.assertEqual(
+            [point.state for point in analysis.points],
+            ["contact", "unresolved", "contact_held"],
+        )
+        interval = analysis.intervals[0].to_dict()
+        self.assertEqual(interval["status"], "active")
+        self.assertFalse(interval["ends_with_unresolved_evidence"])
+        self.assertIsNone(interval["trailing_unresolved_segment"])
+        self.assertEqual(interval["hysteresis_hold_indices"], [2])
+        self.assertEqual(interval["last_observed_contact_index"], 0)
+        self.assertEqual(interval["unresolved_gap_duration"], 1)
+
+    def test_recovery_then_release_beyond_exit_threshold_closes_interval(self):
+        series = make_series(
+            [0.2, None, 0.45, 0.9],
+            missing_atoms_by_index={1: {"right": [7, 8, 9]}},
+            atom_pairs_by_index={1: {"left": [[4, 4]], "right": []}},
+        )
+        analysis = analyze_contacts(series, TRAILING_RULE)
+
+        self.assertEqual(
+            [point.state for point in analysis.points],
+            ["contact", "unresolved", "contact_held", "no_contact"],
+        )
+        interval = analysis.intervals[0].to_dict()
+        self.assertEqual(interval["status"], "lost")
+        self.assertEqual(interval["end_index"], 3)
+        self.assertFalse(interval["ends_with_unresolved_evidence"])
+        self.assertIsNone(interval["trailing_unresolved_segment"])
+        self.assertEqual(
+            [(event.event_type, event.index) for event in analysis.events],
+            [("formed", 0), ("lost", 3)],
+        )
+
+    def test_trailing_missing_summary_survives_export_and_reopen(self):
+        series = make_series(
+            [0.2, 0.25, None],
+            missing_atoms_by_index={2: {"right": [7, 8, 9]}},
+            atom_pairs_by_index={2: {"left": [[4, 4]], "right": []}},
+        )
+        analysis = analyze_contacts(series, TRAILING_RULE)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "contacts.json"
+            save_contact_analysis(analysis, path)
+            exported = json.loads(path.read_text(encoding="utf-8"))
+            reopened = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(reopened, exported)
+        interval = exported["intervals"][0]
+        self.assertEqual(interval["status"], "unresolved")
+        self.assertTrue(interval["ends_with_unresolved_evidence"])
+        self.assertEqual(
+            interval["trailing_unresolved_segment"],
+            {"start_index": 2, "end_index": 2, "evidence_state": "missing_atoms"},
+        )
+        self.assertEqual(interval["last_observed_contact_index"], 1)
+        self.assertEqual(interval["sustained_duration"], 2)
+        self.assertEqual(interval["unresolved_gap_duration"], 1)
 
 
 if __name__ == "__main__":

@@ -118,10 +118,25 @@ class ContactInterval:
             for segment in self.evidence_segments
             if segment["evidence_state"] in ("missing_atoms", "interpretation_disputed")
         ]
+        trailing = None
+        if (
+            self.status == "unresolved"
+            and self.evidence_segments
+            and self.evidence_segments[-1] in gaps
+        ):
+            trailing = dict(self.evidence_segments[-1])
         return {
             "start_index": self.start_index,
             "end_index": self.end_index,
             "status": self.status,
+            "last_observed_contact_index": self.observed_contact_indices[-1]
+            if self.observed_contact_indices
+            else None,
+            "last_confirmed_contact_index": self.confirmed_contact_indices[-1]
+            if self.confirmed_contact_indices
+            else None,
+            "ends_with_unresolved_evidence": trailing is not None,
+            "trailing_unresolved_segment": trailing,
             "observed_contact_duration": len(self.observed_contact_indices),
             "confirmed_contact_duration": len(self.confirmed_contact_indices),
             "hysteresis_hold_duration": len(self.hysteresis_hold_indices),
@@ -200,6 +215,7 @@ def analyze_contacts(series: RelativeMotionSeries, rule: ContactRule | dict[str,
             append_segment(index, evidence)
             active.observed_contact_indices.append(index)
             active.current_observed_run += 1
+            active.status = "active"
             if evidence == "confirmed_contact":
                 active.confirmed_contact_indices.append(index)
             if not announced and active.current_observed_run >= rule.min_contact_duration:
@@ -250,7 +266,8 @@ def analyze_contacts(series: RelativeMotionSeries, rule: ContactRule | dict[str,
     close_segment(len(raw_points) - 1)
     if active is not None:
         if len(active.observed_contact_indices) >= rule.min_contact_duration:
-            active.status = "active"
+            if active.status != "unresolved":
+                active.status = "active"
             intervals.append(active)
     return ContactAnalysis(rule=rule, points=raw_points, intervals=intervals, events=events)
 
