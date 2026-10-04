@@ -43,6 +43,7 @@ class RelativeMotionPoint:
     available_interpretations: int
     decision_id: str | None = None
     alternative_measurements: list[dict[str, Any]] = field(default_factory=list)
+    missing_atoms: dict[str, list[int]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -75,6 +76,7 @@ class RelativeMotionPoint:
             "available_interpretations": self.available_interpretations,
             "decision_id": self.decision_id,
             "alternative_measurements": self.alternative_measurements,
+            "missing_atoms": {name: list(keys) for name, keys in self.missing_atoms.items()},
         }
 
 
@@ -181,6 +183,7 @@ def analyze_relative_motion(
                 available_interpretations=len(measurements),
                 decision_id=decisions.get(source or ""),
                 alternative_measurements=[_measurement_summary(item) for item in measurements],
+                missing_atoms=selected["missing_atoms"],
             )
         )
         if distance is not None:
@@ -209,12 +212,20 @@ def _measurement(comparison: ConformerComparison, name_a: str, name_b: str) -> d
     aligned = comparison.alignment.aligned_mobile
     centers_a, axis_a = _center_and_axis(region_a, aligned)
     centers_b, axis_b = _center_and_axis(region_b, aligned)
-    distance = None if centers_a is None or centers_b is None else float(np.linalg.norm(centers_a - centers_b))
-    angle, status = _axes_angle(axis_a, axis_b, region_a, region_b)
+    missing_atoms = _missing_atoms(comparison, ((name_a, region_a), (name_b, region_b)))
+    if missing_atoms or centers_a is None or centers_b is None:
+        distance = None
+    else:
+        distance = float(np.linalg.norm(centers_a - centers_b))
+    if missing_atoms:
+        angle, status = None, "missing_atoms"
+    else:
+        angle, status = _axes_angle(axis_a, axis_b, region_a, region_b)
     return {
         "distance": distance,
         "angle": angle,
         "angle_status": status,
+        "missing_atoms": missing_atoms,
         "centers": {name_a: _as_list(centers_a), name_b: _as_list(centers_b)},
         "axes": {name_a: _as_list(axis_a), name_b: _as_list(axis_b)},
         "translation": {name_a: region_a.translation_distance, name_b: region_b.translation_distance},
@@ -225,6 +236,18 @@ def _measurement(comparison: ConformerComparison, name_a: str, name_b: str) -> d
             name_b: [[int(ref), int(mob)] for ref, mob in zip(region_b.reference_keys, region_b.mobile_keys)],
         },
     }
+
+
+def _missing_atoms(comparison, named_regions) -> dict[str, list[int]]:
+    definitions = comparison.alignment.region_definitions
+    missing: dict[str, list[int]] = {}
+    for name, region in named_regions:
+        defined = (definitions.get(name) or {}).get("reference_keys") or []
+        measured = set(region.reference_keys)
+        absent = [int(key) for key in defined if key not in measured]
+        if absent:
+            missing[name] = absent
+    return missing
 
 
 def _measurement_summary(value: dict[str, Any]) -> dict[str, Any]:

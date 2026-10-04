@@ -190,6 +190,8 @@ project.contact_rules = [
 
 每个接触点记录距离、采用的候选 ID、实际原子对、构象来源、人工决定 ID 和所有候选解释。缺少关键原子时状态为 `unresolved/missing_atoms`；不同对应关系分别支持接触与不接触时为 `unresolved/interpretation_disputed`。这两种帧都不会触发接触解除，也不会把前后直接观测接触算成一段无间断接触。
 
+区域原子全部缺失或部分缺失时都显式保留为未知：距离与主轴夹角记为 `null`，`missing_atoms` 按区域列出缺失的参照原子 key，仍配对成功的原子继续保留在 `atom_pairs` 中作为证据。缺测帧不会被当成零距离接触，也不会被当成确定分离，接触分析在缺测之后继续恢复、分离与再次接触的判定。区域一个配对原子都没有时不再抛出空数组拼接的 `ValueError`，区域报告的 `rigid_fit_status` 标记为 `missing_atoms`。
+
 持续区间分别统计：
 
 - `observed_contact_duration`：距离直接满足进入条件的构象数；

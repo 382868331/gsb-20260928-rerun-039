@@ -63,6 +63,7 @@ class ContactPoint:
     conformer_name: str
     explanation: str
     alternative_measurements: list[dict[str, Any]] = field(default_factory=list)
+    missing_atoms: dict[str, list[int]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -79,6 +80,7 @@ class ContactPoint:
             "conformer_name": self.conformer_name,
             "explanation": self.explanation,
             "alternative_measurements": self.alternative_measurements,
+            "missing_atoms": {name: list(keys) for name, keys in self.missing_atoms.items()},
         }
 
 
@@ -174,6 +176,13 @@ def analyze_contacts(series: RelativeMotionSeries, rule: ContactRule | dict[str,
 
     def append_segment(start_index: int, state: str) -> None:
         nonlocal segment
+        if (
+            segment is not None
+            and segment["evidence_state"] == state
+            and segment["end_index"] == start_index - 1
+        ):
+            segment["end_index"] = start_index
+            return
         close_segment(start_index - 1)
         segment = {
             "start_index": start_index,
@@ -294,18 +303,19 @@ def _classify_point(point, rule: ContactRule) -> ContactPoint:
     distance = point.distance
     low, high = (None, None) if point.distance_range is None else point.distance_range
     manually_confirmed = point.decision_id is not None
+    missing_atoms = getattr(point, "missing_atoms", None) or {}
     if distance is None:
         evidence = "missing_atoms"
         state = "unresolved"
-        explanation = "Required atoms are absent; contact can neither be formed nor released at this frame."
+        explanation = _missing_atoms_explanation(point, missing_atoms)
     elif low is not None and high is not None and low <= rule.enter_distance and high >= rule.exit_distance:
         evidence = "interpretation_disputed"
         state = "unresolved"
         explanation = "Alternative atom correspondences support both contact and no-contact interpretations."
-    elif low is not None and high is not None and high < rule.exit_distance:
+    elif low is not None and high is not None and high <= rule.enter_distance:
         evidence = "confirmed_contact" if manually_confirmed else "observed_contact"
         state = "contact"
-        explanation = "Every available correspondence places the regions within the release distance."
+        explanation = "Every available correspondence places the regions within the formation distance."
     elif distance <= rule.enter_distance:
         evidence = "confirmed_contact" if manually_confirmed else "observed_contact"
         state = "contact"
@@ -332,4 +342,26 @@ def _classify_point(point, rule: ContactRule) -> ContactPoint:
         conformer_name=point.conformer_name,
         explanation=explanation,
         alternative_measurements=getattr(point, "alternative_measurements", []),
+        missing_atoms=missing_atoms,
+    )
+
+
+def _missing_atoms_explanation(point, missing_atoms: dict[str, list[int]]) -> str:
+    if not missing_atoms:
+        return "Required atoms are absent; contact can neither be formed nor released at this frame."
+    details = []
+    for name, absent_keys in missing_atoms.items():
+        kept = point.atom_pairs.get(name, [])
+        if kept:
+            details.append(
+                f"region {name!r} is partially measured: reference atoms {list(absent_keys)} are absent, "
+                f"{len(kept)} paired atom(s) are retained as evidence"
+            )
+        else:
+            details.append(
+                f"region {name!r} has no paired atoms: all {len(absent_keys)} defined reference atoms are absent"
+            )
+    return (
+        "Missing atoms keep this frame unknown; it is neither a zero-distance contact nor a confirmed "
+        "separation, and it does not close an active contact interval. " + "; ".join(details) + "."
     )

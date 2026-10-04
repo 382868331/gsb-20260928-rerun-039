@@ -337,9 +337,10 @@ class EnsembleTests(unittest.TestCase):
         self.assertIsInstance(series, RelativeMotionSeries)
         self.assertIsNone(series.points[0].angle_deg)
         self.assertEqual(series.points[0].angle_status, "missing_atoms")
-        self.assertIsNotNone(series.points[0].distance)
+        self.assertIsNone(series.points[0].distance)
+        self.assertEqual(series.points[0].missing_atoms, {"left": [4]})
         self.assertEqual(series.points[0].atom_pairs["left"], [[5, 4]])
-        self.assertEqual(series.points[1].motion_state, "approaching")
+        self.assertIsNone(series.points[1].motion_state)
         self.assertIsNotNone(series.points[1].angle_deg)
 
     def test_project_saves_relative_motion_and_limited_correspondence_withdrawal(self):

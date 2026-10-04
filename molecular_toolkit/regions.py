@@ -288,6 +288,9 @@ def _measure_region(name, reference, aligned_mobile, pairs):
         distances=distances,
         vectors=vectors,
     )
+    if not pairs:
+        result.rigid_fit_status = "missing_atoms"
+        return result
     reference_points = np.vstack([reference.atom(key).xyz for key in result.reference_keys])
     aligned_points = np.vstack([aligned_mobile.atom(key).xyz for key in result.mobile_keys])
     _add_local_motion(result, reference_points, aligned_points)
