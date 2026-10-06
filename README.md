@@ -215,3 +215,28 @@ preview = preview_project_correspondence_contact_impact(
 ```
 
 预览中的 `before`/`after` 可直接比较接触事件、区间数量和各类持续时间。确认后再运行项目会生成正式报告；撤回沿用既有决定历史，只重新打开相关不确定构象，不覆盖原始坐标、候选或历史统计。
+
+## 多个接触位点的共同作用时间覆盖
+
+当研究者要求多个物体对在同一时间轴上共同作用时，可把各物体对的 `analyze_contacts` 结果交给 `analyze_joint_contacts`。`handoff_interval` 表示允许的交接间隔（以离散构象数计）：
+
+```python
+from molecular_toolkit import analyze_joint_contacts, compare_joint_contact_conditions
+
+joint = analyze_joint_contacts([ab_contacts, cd_contacts], handoff_interval=1)
+
+comparison = compare_joint_contact_conditions(
+    {
+        "strict_no_handoff": ([ab_strict, cd_strict], 0),
+        "hysteresis_one_frame": ([ab_hysteresis, cd_hysteresis], 1),
+    }
+)
+```
+
+每个构象的共同状态为：
+
+- `joint_contact`：所有必需物体对都有直接接触或迟滞保持证据；
+- `unknown`：至少一个物体对缺原子或解释分歧，且仍处于允许的交接间隔内；
+- `blocked`：至少一个物体对在该构象被确定分离；超过交接间隔的范围不会形成窗口，并在边界阻断依据中说明。
+
+输出窗口分别给出 `confirmed_support_ranges`、每个物体对的 `actual_support_ranges`、`unknown_ranges` 和窗口边界的 `blocking_reasons`。容差只允许覆盖未知构象，不能跨过 `no_contact`；不同物体对彼此错开的离散观测也不会在 `handoff_interval=0` 时拼接。局部缺原子只使依赖该物体对的共同结论变为未知，其他物体对的直接接触证据仍按实际范围保留。改变阈值或交接条件时，可通过 `compare_joint_contact_conditions` 并排比较窗口。共同作用分析只使用距离和接触状态，因此对输入坐标施加刚体旋转和平移不会改变结论。

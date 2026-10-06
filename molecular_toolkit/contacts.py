@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from .relative_motion import RelativeMotionSeries
 
@@ -171,6 +171,52 @@ class ContactAnalysis:
         }
 
 
+@dataclass(eq=False)
+class JointContactWindow:
+    start_index: int
+    end_index: int
+    status: str
+    confirmed_ranges: list[tuple[int, int]] = field(default_factory=list)
+    unknown_ranges: list[tuple[int, int]] = field(default_factory=list)
+    pair_support_ranges: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    blocking_reasons: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "start_index": self.start_index,
+            "end_index": self.end_index,
+            "status": self.status,
+            "confirmed_support_ranges": [list(value) for value in self.confirmed_ranges],
+            "actual_support_ranges": {
+                pair_name: [list(value) for value in ranges]
+                for pair_name, ranges in self.pair_support_ranges.items()
+            },
+            "unknown_ranges": [list(value) for value in self.unknown_ranges],
+            "blocking_reasons": self.blocking_reasons,
+        }
+
+
+@dataclass(eq=False)
+class JointContactAnalysis:
+    handoff_interval: int
+    pair_names: list[str]
+    points: list[dict[str, Any]] = field(default_factory=list)
+    windows: list[JointContactWindow] = field(default_factory=list)
+    blocked_ranges: list[tuple[int, int]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "format": "molecular-toolkit-joint-contact-analysis",
+            "version": 1,
+            "handoff_interval": self.handoff_interval,
+            "required_pairs": self.pair_names,
+            "point_count": len(self.points),
+            "points": self.points,
+            "windows": [window.to_dict() for window in self.windows],
+            "blocked_ranges": [list(value) for value in self.blocked_ranges],
+        }
+
+
 def analyze_contacts(series: RelativeMotionSeries, rule: ContactRule | dict[str, Any]) -> ContactAnalysis:
     rule = ContactRule.from_value(rule)
     _assert_series_regions(series, rule)
@@ -299,10 +345,292 @@ def contact_analyses_for_series(
     return [analyze_contacts(series, rule) for rule in rules if _matches_series(series, rule)]
 
 
+def analyze_joint_contacts(
+    analyses: Sequence[ContactAnalysis],
+    handoff_interval: int = 0,
+) -> JointContactAnalysis:
+    if not analyses:
+        raise ValueError("at least one contact analysis is required")
+    if handoff_interval < 0:
+        raise ValueError("handoff_interval must be non-negative")
+
+    pair_names = [_pair_name(analysis) for analysis in analyses]
+    point_count = len(analyses[0].points)
+    if any(len(analysis.points) != point_count for analysis in analyses):
+        raise ValueError("all contact analyses must cover the same frame indices")
+    expected_indices = list(range(point_count))
+    for analysis in analyses:
+        actual_indices = [point.index for point in analysis.points]
+        if actual_indices != expected_indices:
+            raise ValueError("all contact analyses must use consecutive frame indices starting at zero")
+
+    pair_masks = [_pair_masks(analysis) for analysis in analyses]
+    direct_support = [masks["contact"] for masks in pair_masks]
+    point_states: list[dict[str, Any]] = []
+    possible_frames: list[int] = []
+    blocked_frames: set[int] = set()
+
+    for index in range(point_count):
+        supported = []
+        unknown_reasons = []
+        blocked_reasons = []
+        for pair_index, analysis in enumerate(analyses):
+            point = analysis.points[index]
+            pair_name = pair_names[pair_index]
+            if point.state in ("contact", "contact_held"):
+                supported.append(pair_name)
+            elif point.state == "no_contact":
+                blocked_reasons.append(_frame_reason(pair_name, point, "confirmed_separation"))
+            else:
+                unknown_reasons.append(
+                    _frame_reason(pair_name, point, point.evidence_state or "unresolved")
+                )
+
+        if blocked_reasons:
+            state = "blocked"
+            blocked_frames.add(index)
+            possible = False
+        elif len(supported) == len(analyses):
+            state = "joint_contact"
+            possible = True
+        else:
+            state = "unknown"
+            possible = _is_within_handoff(pair_masks, index, handoff_interval, blocked_frames)
+            if not possible:
+                unknown_reasons.append(
+                    {
+                        "reason": "handoff_interval_exceeded",
+                        "handoff_interval": handoff_interval,
+                    }
+                )
+
+        if possible:
+            possible_frames.append(index)
+        point_states.append(
+            {
+                "index": index,
+                "state": state,
+                "supported_pairs": supported,
+                "unknown_reasons": unknown_reasons,
+                "blocking_reasons": blocked_reasons,
+            }
+        )
+
+    windows = []
+    for start, end in _ranges_from_indices(possible_frames):
+        confirmed_ranges = [
+            (frame, frame)
+            for frame in range(start, end + 1)
+            if point_states[frame]["state"] == "joint_contact"
+        ]
+        confirmed_ranges = _merge_ranges(confirmed_ranges)
+        unknown_ranges = _merge_ranges(
+            [
+                (frame, frame)
+                for frame in range(start, end + 1)
+                if point_states[frame]["state"] == "unknown"
+            ]
+        )
+        pair_support_ranges = {
+            pair_name: _merge_ranges(
+                [
+                    (frame, frame)
+                    for frame in range(start, end + 1)
+                    if direct_support[pair_index][frame]
+                ]
+            )
+            for pair_index, pair_name in enumerate(pair_names)
+        }
+        windows.append(
+            JointContactWindow(
+                start_index=start,
+                end_index=end,
+                status="confirmed" if confirmed_ranges else "unknown",
+                confirmed_ranges=confirmed_ranges,
+                unknown_ranges=unknown_ranges,
+                pair_support_ranges=pair_support_ranges,
+                blocking_reasons=_window_boundary_reasons(
+                    start,
+                    end,
+                    point_count,
+                    point_states,
+                    direct_support,
+                    pair_names,
+                    handoff_interval,
+                ),
+            )
+        )
+
+    return JointContactAnalysis(
+        handoff_interval=handoff_interval,
+        pair_names=pair_names,
+        points=point_states,
+        windows=windows,
+        blocked_ranges=_merge_ranges([(index, index) for index in sorted(blocked_frames)]),
+    )
+
+
+def compare_joint_contact_conditions(
+    conditions: Mapping[str, tuple[Sequence[ContactAnalysis], int]],
+) -> dict[str, JointContactAnalysis]:
+    return {
+        label: analyze_joint_contacts(analyses, handoff_interval)
+        for label, (analyses, handoff_interval) in conditions.items()
+    }
+
+
+def save_joint_contact_analysis(analysis: JointContactAnalysis, path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(analysis.to_dict(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 def save_contact_analysis(analysis: ContactAnalysis, path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(analysis.to_dict(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _pair_name(analysis: ContactAnalysis) -> str:
+    return f"{analysis.rule.region_a}__{analysis.rule.region_b}"
+
+
+def _direct_support_mask(analysis: ContactAnalysis) -> list[bool]:
+    return [point.state in ("contact", "contact_held") for point in analysis.points]
+
+
+def _pair_masks(analysis: ContactAnalysis) -> dict[str, list[bool]]:
+    return {
+        "contact": _direct_support_mask(analysis),
+        "separated": [point.state == "no_contact" for point in analysis.points],
+    }
+
+
+def _is_within_handoff(
+    pair_masks: Sequence[Mapping[str, Sequence[bool]]],
+    index: int,
+    handoff_interval: int,
+    blocked_frames: set[int],
+) -> bool:
+    for masks in pair_masks:
+        support = masks["contact"]
+        separated = masks["separated"]
+        if support[index]:
+            continue
+        near_support = False
+        for distance in range(handoff_interval + 1):
+            candidates = [index - distance, index + distance] if distance else [index]
+            for candidate in candidates:
+                if not 0 <= candidate < len(support) or not support[candidate]:
+                    continue
+                step = 1 if candidate >= index else -1
+                boundary = candidate + step
+                if any(
+                    between in blocked_frames or separated[between]
+                    for between in range(index, boundary, step)
+                ):
+                    continue
+                near_support = True
+        if not near_support:
+            return False
+    return True
+
+
+def _frame_reason(pair_name: str, point: ContactPoint, reason: str) -> dict[str, Any]:
+    return {
+        "pair": pair_name,
+        "index": point.index,
+        "reason": reason,
+        "state": point.state,
+        "evidence_state": point.evidence_state,
+        "missing_atoms": dict(point.missing_atoms),
+        "explanation": point.explanation,
+    }
+
+
+def _ranges_from_indices(indices: Sequence[int]) -> list[tuple[int, int]]:
+    if not indices:
+        return []
+    ranges = []
+    start = previous = indices[0]
+    for index in indices[1:]:
+        if index == previous + 1:
+            previous = index
+            continue
+        ranges.append((start, previous))
+        start = previous = index
+    ranges.append((start, previous))
+    return ranges
+
+
+def _merge_ranges(ranges: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not ranges:
+        return []
+    ordered = sorted(ranges)
+    merged = [ordered[0]]
+    for start, end in ordered[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end + 1:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _window_boundary_reasons(
+    start: int,
+    end: int,
+    point_count: int,
+    point_states: Sequence[dict[str, Any]],
+    direct_support: Sequence[Sequence[bool]],
+    pair_names: Sequence[str],
+    handoff_interval: int,
+) -> list[dict[str, Any]]:
+    reasons = []
+    if start > 0:
+        reasons.extend(_boundary_reasons(start, start - 1, point_states, direct_support, pair_names, handoff_interval))
+    else:
+        reasons.append({"boundary": "start", "reason": "series_start"})
+    if end + 1 < point_count:
+        reasons.extend(_boundary_reasons(end, end + 1, point_states, direct_support, pair_names, handoff_interval))
+    else:
+        reasons.append({"boundary": "end", "reason": "series_end"})
+    return reasons
+
+
+def _boundary_reasons(
+    inside: int,
+    outside: int,
+    point_states: Sequence[dict[str, Any]],
+    direct_support: Sequence[Sequence[bool]],
+    pair_names: Sequence[str],
+    handoff_interval: int,
+) -> list[dict[str, Any]]:
+    reasons = []
+    for frame_reason in point_states[outside].get("blocking_reasons", []):
+        reasons.append({"boundary": "end" if outside > inside else "start", **frame_reason})
+    for pair_index, pair_name in enumerate(pair_names):
+        if direct_support[pair_index][outside]:
+            continue
+        nearest = _nearest_support(direct_support[pair_index], outside)
+        if nearest is None or abs(nearest - outside) > handoff_interval:
+            reasons.append(
+                {
+                    "boundary": "end" if outside > inside else "start",
+                    "index": outside,
+                    "pair": pair_name,
+                    "reason": "handoff_interval_exceeded",
+                    "handoff_interval": handoff_interval,
+                }
+            )
+    return reasons
+
+
+def _nearest_support(support: Sequence[bool], index: int) -> int | None:
+    candidates = [candidate for candidate, is_supported in enumerate(support) if is_supported]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda candidate: (abs(candidate - index), candidate))
 
 
 def contact_decision_preview(before: ContactAnalysis, after: ContactAnalysis) -> dict[str, Any]:
