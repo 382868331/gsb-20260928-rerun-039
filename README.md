@@ -215,3 +215,29 @@ preview = preview_project_correspondence_contact_impact(
 ```
 
 预览中的 `before`/`after` 可直接比较接触事件、区间数量和各类持续时间。确认后再运行项目会生成正式报告；撤回沿用既有决定历史，只重新打开相关不确定构象，不覆盖原始坐标、候选或历史统计。
+
+## 多接触位点共同作用的时间覆盖
+
+当研究问题要求一组物体对必须同时接触时，用 `JointContactRule` 指定成员接触规则（每对的进入/解除阈值可不同）和允许的交接间隔 `max_handoff_gap`，`analyze_joint_contacts` 直接复用各对已有的接触分析（接触、迟滞保持、分离、未知区间）计算共同作用覆盖：
+
+```python
+from molecular_toolkit import JointContactRule, ContactRule, analyze_contacts, analyze_joint_contacts
+
+rule = JointContactRule(
+    members=[
+        ContactRule("left", "right", 0.3, 0.6),
+        ContactRule("left", "top", 0.3, 0.6),
+    ],
+    max_handoff_gap=1,
+)
+analyses = [analyze_contacts(series, member) for series, member in zip(series_list, rule.members)]
+joint = analyze_joint_contacts(analyses, rule)
+```
+
+判定规则：
+
+- 某一帧只有所有成员对都处于接触（含迟滞保持）时才记为共同接触；不同对的离散观测不会跨帧拼接成连续共同接触。
+- 任一成员被证实分离（达到解除距离）的帧是阻断帧，附带阻断依据（哪一对、距离、解除阈值）；长度不超过 `max_handoff_gap` 且两端都是共同接触的短暂分离会被吸收为交接帧，窗口延续但这些帧不计入已证实时长。
+- 缺原子或解释分歧的帧只使依赖该位置的共同结论未知，进入 `undetermined_ranges`，既不当作共同接触也不当作分离，前后窗口不会跨越它合并；以未知帧结尾的窗口状态为 `interrupted_unknown`。
+
+每个窗口返回 `proven_contact_indices`、`handoff_indices` 及逐帧阻断依据，以及 `member_support`：各成员对与窗口重叠的实际接触区间和逐帧证据状态。`analyze_joint_contact_scenarios(series_list, scenarios)` 可一次比较不同阈值与交接条件的多个方案，返回每个方案的窗口、已证实/未知/阻断时长及汇总。项目中设置 `joint_contact_rules` 后，运行项目会在每个参照区域目录下生成 `joint_contacts/<名称>.json`；成员对需已列入 `relative_motion_pairs`。刚体变换不改变任何共同作用结论。

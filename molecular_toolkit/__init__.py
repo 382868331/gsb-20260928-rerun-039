@@ -23,6 +23,14 @@ from .contacts import (
     contact_decision_preview,
     save_contact_analysis,
 )
+from .joint_contacts import (
+    JointContactAnalysis,
+    JointContactRule,
+    JointWindow,
+    analyze_joint_contact_scenarios,
+    analyze_joint_contacts,
+    save_joint_contact_analysis,
+)
 from .project import (
     ComparisonProject,
     ConformerCorrespondenceSpec,
@@ -93,6 +101,12 @@ __all__ = [
     "contact_analyses_for_series",
     "contact_decision_preview",
     "save_contact_analysis",
+    "JointContactRule",
+    "JointContactAnalysis",
+    "JointWindow",
+    "analyze_joint_contacts",
+    "analyze_joint_contact_scenarios",
+    "save_joint_contact_analysis",
     "preview_project_correspondence_contact_impact",
     "AlignmentResult",
     "align_structures",

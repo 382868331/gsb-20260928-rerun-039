@@ -17,6 +17,11 @@ from .contacts import (
     contact_decision_preview,
     save_contact_analysis,
 )
+from .joint_contacts import (
+    JointContactRule,
+    analyze_joint_contacts,
+    save_joint_contact_analysis,
+)
 from .structures import load_structure
 
 
@@ -98,6 +103,7 @@ class ComparisonProject:
     notes: list[str] = field(default_factory=list)
     relative_motion_pairs: list[list[str]] = field(default_factory=list)
     contact_rules: list[dict[str, Any]] = field(default_factory=list)
+    joint_contact_rules: list[dict[str, Any]] = field(default_factory=list)
     correspondence_decisions: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -135,6 +141,9 @@ class ComparisonProject:
             "conformers": [_spec_to_dict(spec) for spec in self.conformers],
             "relative_motion_pairs": [list(pair) for pair in self.relative_motion_pairs],
             "contact_rules": [ContactRule.from_value(rule).to_dict() for rule in self.contact_rules],
+            "joint_contact_rules": [
+                JointContactRule.from_value(rule).to_dict() for rule in self.joint_contact_rules
+            ],
             "correspondence_decisions": self.correspondence_decisions,
             "notes": self.notes,
         }
@@ -161,6 +170,7 @@ def load_comparison_project(path: str | Path) -> ComparisonProject:
         notes=list(data.get("notes", [])),
         relative_motion_pairs=[list(pair) for pair in data.get("relative_motion_pairs", [])],
         contact_rules=list(data.get("contact_rules", [])),
+        joint_contact_rules=list(data.get("joint_contact_rules", [])),
         correspondence_decisions=list(data.get("correspondence_decisions", [])),
     )
 
@@ -334,6 +344,7 @@ def preview_project_correspondence_contact_impact(
 
 
 def _save_project_relative_motion_reports(project, runs, reference, region_args, report_directory):
+    series_by_reference: dict[str, list] = {name: [] for name in runs}
     for region_names in project.relative_motion_pairs:
         if len(region_names) != 2:
             raise ValueError("Each relative motion entry must contain two region names")
@@ -360,6 +371,7 @@ def _save_project_relative_motion_reports(project, runs, reference, region_args,
                 series,
                 report_directory / reference_name / "relative_motion" / filename,
             )
+            series_by_reference[reference_name].append(series)
             for analysis in contact_analyses_for_series(series, project.contact_rules):
                 contact_filename = (
                     f"{analysis.rule.region_a}__{analysis.rule.region_b}"
@@ -371,6 +383,29 @@ def _save_project_relative_motion_reports(project, runs, reference, region_args,
                     analysis,
                     report_directory / reference_name / "contacts" / contact_filename,
                 )
+    for joint_value in project.joint_contact_rules:
+        joint_rule = JointContactRule.from_value(joint_value)
+        for reference_name, series_list in series_by_reference.items():
+            member_analyses = []
+            for member in joint_rule.members:
+                matching = [
+                    series
+                    for series in series_list
+                    if {series.region_a, series.region_b} == {member.region_a, member.region_b}
+                ]
+                if not matching:
+                    raise ValueError(
+                        "Joint contact rule %r needs relative motion coverage for pair "
+                        "%s/%s; add it to relative_motion_pairs"
+                        % (joint_rule.name, member.region_a, member.region_b)
+                    )
+                member_analyses.append(analyze_contacts(matching[0], member))
+            joint_analysis = analyze_joint_contacts(member_analyses, joint_rule)
+            joint_filename = (joint_rule.name or "joint").replace("/", "_") + ".json"
+            save_joint_contact_analysis(
+                joint_analysis,
+                report_directory / reference_name / "joint_contacts" / joint_filename,
+            )
 
 
 def save_reference_region_summary(runs: dict[str, list], path: str | Path) -> None:
